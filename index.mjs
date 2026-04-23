@@ -448,6 +448,111 @@ const VOICE_ID_RE = /^[a-zA-Z0-9]{10,40}$/;
 const TIME_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 
 /**
+ * Build the runtime-config shape consumed by the Fargate voice pipeline.
+ *
+ * Returns an OG-compatible AgentConfig object (nested llm / tts / stt /
+ * tools / recording / post_call_analyses) so the forked cosentus-voice-engine
+ * can parse identical shapes with zero translation. This intentionally
+ * mirrors `voiceagent/core/config_loader.py::row_to_config` in the old
+ * repo — any schema additions here need to land on both sides.
+ *
+ * Fork-specific notes for downstream consumers:
+ * - `llm.provider` may be 'anthropic' from Aurora. The fork ignores that
+ *   and always routes through Bedrock; see the fork's
+ *   `_resolve_bedrock_model_id()` adapter.
+ * - `tools` is passed through as `[{type, description, settings}, ...]`.
+ *   The fork maps each `type` to a local Python tool implementation in
+ *   Phase 7C; until then it's informational.
+ * - `post_call_analyses` and `recording` are pass-through for Phase 7E.
+ */
+export function buildRuntimeConfig(row) {
+  // pg returns NUMERIC columns as strings. Convert defensively so consumers
+  // get real numbers instead of "0.75". Belongs in a type parser one day
+  // (tech-debt issue #4) — for now it's enough to fix at the response
+  // boundary of this single endpoint.
+  const num = (v, fallback = null) => {
+    if (v === null || v === undefined) return fallback;
+    const n = typeof v === 'number' ? v : parseFloat(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
+  const pcaRaw = row.post_call_analyses;
+  const pcaConfig =
+    pcaRaw && typeof pcaRaw === 'object' && Array.isArray(pcaRaw.fields)
+      ? {
+          model: pcaRaw.model || 'claude-haiku-4-5-20251001',
+          fields: pcaRaw.fields
+            .filter((f) => f && typeof f === 'object')
+            .map((f) => ({
+              name: f.name || '',
+              type: f.type || 'text',
+              description: f.description || '',
+              format_examples: Array.isArray(f.format_examples) ? f.format_examples : [],
+              choices: Array.isArray(f.choices) ? f.choices : [],
+            })),
+        }
+      : null;
+
+  const toolsRaw = Array.isArray(row.tools) ? row.tools : [];
+  const tools = toolsRaw
+    .filter((t) => t && typeof t === 'object' && typeof t.type === 'string')
+    .map((t) => ({
+      type: t.type,
+      description: typeof t.description === 'string' ? t.description : '',
+      settings: t.settings && typeof t.settings === 'object' ? t.settings : {},
+    }));
+
+  return {
+    name: row.name,
+    display_name: row.display_name || row.name,
+    description: row.description || '',
+    system_prompt: row.system_prompt || '',
+    first_message: row.first_message || '',
+    ivr_goal: row.ivr_goal || '',
+    llm: {
+      provider: row.llm_provider || 'anthropic',
+      model: row.llm_model || 'claude-sonnet-4-6',
+      max_tokens: num(row.max_tokens, 200),
+      temperature: num(row.temperature, 0.7),
+      enable_prompt_caching: Boolean(row.enable_prompt_caching),
+    },
+    tts: {
+      provider: row.tts_provider || 'elevenlabs',
+      voice_id: row.tts_voice_id || '',
+      model: row.tts_model || 'eleven_turbo_v2_5',
+      settings: {
+        stability: num(row.tts_stability),
+        similarity_boost: num(row.tts_similarity_boost),
+        style: num(row.tts_style),
+        use_speaker_boost:
+          row.tts_use_speaker_boost === null || row.tts_use_speaker_boost === undefined
+            ? null
+            : Boolean(row.tts_use_speaker_boost),
+        speed: num(row.tts_speed),
+      },
+    },
+    stt: {
+      provider: row.stt_provider || 'deepgram',
+      language: row.stt_language || 'en',
+      keywords: Array.isArray(row.stt_keywords) ? row.stt_keywords : [],
+    },
+    tools,
+    recording: {
+      enabled: row.recording_enabled !== false,
+      channels: num(row.recording_channels, 2),
+    },
+    post_call_analyses: pcaConfig,
+    // Metadata for pipeline's structured log `agent_config_loaded`.
+    // `version` is the row's updated_at as unix millis so the fork can
+    // log it without parsing ISO strings.
+    _meta: {
+      agent_id: row.id,
+      version: row.updated_at ? new Date(row.updated_at).getTime() : 0,
+    },
+  };
+}
+
+/**
  * Validate the merged state of a draft save (UPSERT or UPDATE).
  *
  * Pure helper — takes the existing DB row (or null/undefined) and the
@@ -714,7 +819,7 @@ export async function handler(event) {
       return respond(200, {
         status: 'healthy',
         db: r.rows[0]?.ok === 1,
-        version: 'voice-api-1.0.2',
+        version: 'voice-api-1.1.0',
         // Populated at deploy time by scripts/deploy.sh via an env var so
         // we can correlate a live /health response to a specific commit
         // in the cosentus-voice-api-lambda repo. Falls back to 'unknown'
@@ -815,6 +920,27 @@ export async function handler(event) {
         );
         const r = await pool.query(`SELECT ${AGENT_COLS} FROM voice_agents WHERE id = $1`, [newId]);
         return respond(201, r.rows[0]);
+      }
+
+      // GET /api/agents/:id/runtime-config
+      //
+      // Returns the full agent config the Fargate pipeline needs to run a
+      // call. Shape matches the OG voiceagent/core/config_loader.py
+      // AgentConfig model exactly — nested llm/tts/stt/tools/recording/
+      // post_call_analyses. See `buildRuntimeConfig` for the field mapping.
+      //
+      // `:id` accepts BOTH the agent UUID (Daily inbound webhook in 7B
+      // passes voice_phone_numbers.inbound_agent_id which is UUID) and the
+      // agent name (scripts + the OG EC2 pipeline's convention). Detected
+      // via UUID_RE; the lookup column switches accordingly.
+      if (method === 'GET' && id && sub === 'runtime-config') {
+        const isUuid = UUID_RE.test(id);
+        const r = await pool.query(
+          `SELECT ${AGENT_COLS} FROM voice_agents WHERE ${isUuid ? 'id' : 'name'} = $1`,
+          [id]
+        );
+        if (!r.rows.length) return respond(404, { detail: 'Agent not found' });
+        return respond(200, buildRuntimeConfig(r.rows[0]));
       }
 
       // GET /api/agents/:name/prompt

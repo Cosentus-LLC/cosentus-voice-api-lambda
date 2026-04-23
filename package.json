@@ -1,6 +1,6 @@
 {
   "name": "medcloud-voice-api",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "type": "module",
   "description": "Aurora-backed REST API powering the Cosentus voice platform (agents, drafts, batches, calls, recordings). Deployed as AWS Lambda medcloud-voice-api.",
   "main": "index.mjs",
