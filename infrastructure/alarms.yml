@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudWatch alarms for medcloud-voice-api Lambda. Deploy as a single
+  stack named `medcloud-voice-api-alarms` via:
+
+      aws cloudformation deploy \
+        --stack-name medcloud-voice-api-alarms \
+        --template-file infrastructure/alarms.yml \
+        --region us-east-1 \
+        --parameter-overrides AlertTopicArn=arn:aws:sns:us-east-1:825269749545:voice-api-oncall
+
+  Alarms are intentionally minimal — a three-alarm starter kit that
+  covers the failure modes we've already hit (error spikes from bad
+  deploys) and one classic Lambda gotcha (throttling under load). Tune
+  thresholds once there's real baseline telemetry.
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: medcloud-voice-api
+    Description: Lambda function name to alarm on.
+
+  AlertTopicArn:
+    Type: String
+    Description: >
+      SNS topic that receives alarm notifications. Create this topic
+      separately (it likely already exists in the medcloud account
+      for other on-call alerts) and subscribe your email / Slack /
+      PagerDuty endpoint to it.
+
+  ErrorThreshold:
+    Type: Number
+    Default: 1
+    Description: >
+      Minimum errors per 5-minute window that triggers the error alarm.
+      Set low (1) during stabilization; bump once baseline is clean.
+
+  P95DurationThresholdMs:
+    Type: Number
+    Default: 2000
+    Description: >
+      p95 Duration (ms) ceiling per 5-minute window. Lambda timeout is
+      120s so p95>2s is already "user-observable slow". Tighten once
+      cold-start latency is understood (see TECH-DEBT §4.2 in the
+      old voice-engine repo).
+
+  ThrottleThreshold:
+    Type: Number
+    Default: 1
+    Description: >
+      Throttles per 5-minute window. Should normally be 0. Hitting
+      this usually means concurrent Lambda invocations exceeded the
+      account's reserved concurrency. Investigate before raising.
+
+Resources:
+  ErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-errors'
+      AlarmDescription: >
+        Lambda raised one or more uncaught exceptions in the last 5
+        minutes. Check CloudWatch Logs for the stack trace; common
+        causes are Aurora connection timeouts, malformed request
+        bodies, and validator regressions post-deploy.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+  P95DurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-p95-duration'
+      AlarmDescription: >
+        95th percentile invocation duration exceeded the threshold
+        over the last 5 minutes. Sustained elevated p95 usually
+        indicates Aurora is slow (check RDS Performance Insights) or
+        the Lambda is cold-starting more often than expected
+        (consider provisioned concurrency — see TECH-DEBT §4.2).
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3  # Must breach for 15 minutes to avoid flapping on transient spikes
+      Threshold: !Ref P95DurationThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-throttles'
+      AlarmDescription: >
+        Lambda concurrency limit hit — some invocations were throttled.
+        Expected floor is 0. If non-zero sustained, raise the reserved
+        concurrency on the function or investigate an upstream traffic
+        spike (batch caller? runaway loop?). Default account-level
+        Lambda concurrency limit is 1000 — this alarm fires well
+        before we get close to that on this function alone.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ThrottleThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+Outputs:
+  ErrorAlarmArn:
+    Value: !GetAtt ErrorRateAlarm.Arn
+    Description: ARN of the Errors alarm
+  P95DurationAlarmArn:
+    Value: !GetAtt P95DurationAlarm.Arn
+    Description: ARN of the p95 Duration alarm
+  ThrottleAlarmArn:
+    Value: !GetAtt ThrottleAlarm.Arn
+    Description: ARN of the Throttles alarm
