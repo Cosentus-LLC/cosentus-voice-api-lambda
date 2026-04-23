@@ -394,26 +394,30 @@ function parseRoute(event) {
 const AGENT_COLS = `id, name, display_name, description, llm_provider, llm_model, temperature, max_tokens, enable_prompt_caching, tts_provider, tts_voice_id, tts_model, tts_stability, tts_similarity_boost, tts_style, tts_use_speaker_boost, tts_speed, stt_provider, stt_language, stt_keywords, tools, system_prompt, first_message, ivr_goal, recording_enabled, recording_channels, post_call_analyses, idle_timeout_secs, idle_message, max_call_duration_secs, voicemail_action, voicemail_message, max_retries, retry_delay_secs, default_concurrency, calling_window_start, calling_window_end, calling_window_days, is_active, created_at, updated_at`;
 
 // ─── Validation constants (shared by schema endpoint + write handlers) ─────
-const VALID_LLM_MODELS = [
+// NOTE: the following module-level constants and validators are `export`ed
+// purely so the test suite in `test/` can import them. This has zero runtime
+// effect on the Lambda handler — the deploy zip still exposes `handler` as
+// the only Lambda entrypoint.
+export const VALID_LLM_MODELS = [
   'claude-sonnet-4-6',
   'claude-haiku-4-5-20241022',
   'claude-sonnet-4-5-20250514',
 ];
-const VALID_TTS_PROVIDERS = ['elevenlabs'];
+export const VALID_TTS_PROVIDERS = ['elevenlabs'];
 // Per-provider model lists. Keep flat VALID_TTS_MODELS for legacy consumers
 // that don't know about providers yet.
-const TTS_MODELS_BY_PROVIDER = {
+export const TTS_MODELS_BY_PROVIDER = {
   elevenlabs: ['eleven_turbo_v2_5', 'eleven_flash_v2_5', 'eleven_multilingual_v2'],
 };
-const VALID_TTS_MODELS = Object.values(TTS_MODELS_BY_PROVIDER).flat();
-const VALID_STT_PROVIDERS = ['deepgram', 'elevenlabs'];
-const VALID_STT_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'it', 'ja', 'ko', 'zh', 'ar', 'hi'];
-const VALID_TOOL_TYPES = ['end_call', 'press_digit', 'transfer_call'];
-const VALID_VOICEMAIL_ACTIONS = ['hang_up', 'leave_message'];
-const VALID_CALLING_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-const VALID_POST_CALL_FIELD_TYPES = ['text', 'selector'];
+export const VALID_TTS_MODELS = Object.values(TTS_MODELS_BY_PROVIDER).flat();
+export const VALID_STT_PROVIDERS = ['deepgram', 'elevenlabs'];
+export const VALID_STT_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'it', 'ja', 'ko', 'zh', 'ar', 'hi'];
+export const VALID_TOOL_TYPES = ['end_call', 'press_digit', 'transfer_call'];
+export const VALID_VOICEMAIL_ACTIONS = ['hang_up', 'leave_message'];
+export const VALID_CALLING_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+export const VALID_POST_CALL_FIELD_TYPES = ['text', 'selector'];
 
-const FIELD_RANGES = {
+export const FIELD_RANGES = {
   temperature:            { min: 0.0, max: 1.0,  step: 0.05, default: 0.2 },
   max_tokens:             { min: 50,  max: 1000, step: 10,   default: 390 },
   tts_stability:          { min: 0.0, max: 1.0,  step: 0.05, default: 0.75 },
@@ -434,7 +438,23 @@ const AGENT_NAME_RE = /^[a-z0-9][a-z0-9\-]*$/;
 const VOICE_ID_RE = /^[a-zA-Z0-9]{10,40}$/;
 const TIME_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 
-function validateAgentData(data) {
+/**
+ * Validate the merged state of a draft save (UPSERT or UPDATE).
+ *
+ * Pure helper — takes the existing DB row (or null/undefined) and the
+ * incoming patch, returns validation errors. Extracted from the POST and
+ * PUT /api/agent-drafts handlers so the same merge-and-validate code path
+ * runs for both and so it's unit-testable without mocking `pool`.
+ *
+ * The ORDER of spread matters: existing → incoming. Incoming fields
+ * overwrite existing ones, matching pg's ON CONFLICT DO UPDATE semantics.
+ */
+export function validateDraftMerged(existingRow, incomingBody) {
+  const merged = { ...(existingRow || {}), ...(incomingBody || {}) };
+  return validateAgentData(merged);
+}
+
+export function validateAgentData(data) {
   const errors = [];
 
   // Numeric ranges
@@ -837,8 +857,7 @@ export async function handler(event) {
         const existing = body.agent_id
           ? (await pool.query('SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [body.agent_id])).rows[0]
           : null;
-        const merged = { ...(existing || {}), ...body };
-        const vErrors = validateAgentData(merged);
+        const vErrors = validateDraftMerged(existing, body);
         if (vErrors.length) return respond(400, { error: 'Validation failed', details: vErrors });
         const newId = uuid();
         body.id = newId;
@@ -871,8 +890,7 @@ export async function handler(event) {
         const existing = await pool.query(
           'SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]
         );
-        const merged = { ...(existing.rows[0] || {}), ...body };
-        const vErrors = validateAgentData(merged);
+        const vErrors = validateDraftMerged(existing.rows[0], body);
         if (vErrors.length) return respond(400, { error: 'Validation failed', details: vErrors });
         body.updated_at = new Date().toISOString();
         for (const k of Object.keys(body)) {
