@@ -705,7 +705,7 @@ export async function handler(event) {
       return respond(200, {
         status: 'healthy',
         db: r.rows[0]?.ok === 1,
-        version: 'voice-api-1.0.1',
+        version: 'voice-api-1.0.2',
         // Populated at deploy time by scripts/deploy.sh via an env var so
         // we can correlate a live /health response to a specific commit
         // in the cosentus-voice-api-lambda repo. Falls back to 'unknown'
