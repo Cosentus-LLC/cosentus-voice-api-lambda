@@ -163,20 +163,30 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 # Fresh install with prod deps only.
-STAGE="$BUILD_DIR/stage"
-mkdir -p "$STAGE"
-cp index.mjs package.json package-lock.json "$STAGE/"
+STAGE_DIR="$BUILD_DIR/stage"
+mkdir -p "$STAGE_DIR"
+cp index.mjs package.json package-lock.json "$STAGE_DIR/"
+
+# Copy any additional source directories (e.g. lib/ helpers). Anything that
+# index.mjs imports relatively (./lib/foo.mjs, ./helpers/bar.mjs, etc.) must
+# live under one of these directories or the Lambda runtime will ERR_MODULE_NOT_FOUND.
+# When adding a new source dir, add it here.
+for src_dir in lib; do
+    if [ -d "$src_dir" ]; then
+        cp -R "$src_dir" "$STAGE_DIR/"
+    fi
+done
 
 (
-    cd "$STAGE"
+    cd "$STAGE_DIR"
     npm ci --omit=dev --silent
 )
 
-# Zip contents from inside $STAGE so the archive is flat (index.mjs at root,
+# Zip contents from inside $STAGE_DIR so the archive is flat (index.mjs at root,
 # not inside a stage/ subdirectory — Lambda expects Handler.functionName to
 # resolve at zip root).
 (
-    cd "$STAGE"
+    cd "$STAGE_DIR"
     zip -qr "$ZIP_PATH" .
 )
 

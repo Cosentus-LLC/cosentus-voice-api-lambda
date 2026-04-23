@@ -50,6 +50,7 @@
 import pg from 'pg';
 import crypto from 'crypto';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import * as dailyPhoneClient from './lib/daily-phone-client.mjs';
 const { Pool } = pg;
 
 // ─── SQS (call request queue) ───────────────────────────────────────────────
@@ -364,6 +365,14 @@ async function ensureTables() {
   const migrations = [
     `ALTER TABLE voice_agents       ADD COLUMN IF NOT EXISTS ivr_goal TEXT DEFAULT ''`,
     `ALTER TABLE voice_agent_drafts ADD COLUMN IF NOT EXISTS ivr_goal TEXT DEFAULT ''`,
+    // Phone-number provider support. Defaults to 'twilio' so every
+    // existing row gets that value — existing Twilio numbers keep
+    // working unchanged while Daily rolls out. daily_number_id is
+    // only populated for provider='daily' rows; it's the UUID returned
+    // by Daily's POST /buy-phone-number and is required for release.
+    `ALTER TABLE voice_phone_numbers ADD COLUMN IF NOT EXISTS provider VARCHAR(20) NOT NULL DEFAULT 'twilio'`,
+    `ALTER TABLE voice_phone_numbers ADD COLUMN IF NOT EXISTS daily_number_id UUID`,
+    `ALTER TABLE voice_phone_numbers ADD CONSTRAINT voice_phone_numbers_provider_valid CHECK (provider IN ('twilio', 'daily')) NOT VALID`,
   ];
   for (const sql of migrations) {
     try { await pool.query(sql); } catch (e) { console.warn('[voice-api] Migration warning:', e.message?.substring(0, 100)); }
@@ -1146,7 +1155,8 @@ export async function handler(event) {
 
     // ═══ Phone Numbers ═══
     if (resource === 'phone-numbers') {
-      // GET /api/phone-numbers
+      // GET /api/phone-numbers — list all. Returns provider + daily_number_id
+      // via `pn.*`; the frontend renders a provider badge on each row.
       if (method === 'GET' && !id) {
         const r = await pool.query(`
           SELECT pn.*, 
@@ -1159,21 +1169,34 @@ export async function handler(event) {
         `);
         return respond(200, { phone_numbers: r.rows });
       }
-      // POST /api/phone-numbers (upsert by number)
+      // POST /api/phone-numbers (upsert by number — used for manual adds).
+      // Accepts provider + daily_number_id when a number was bought via the
+      // /buy route; /buy itself also inserts via this code path so we get
+      // the same conflict handling. Defaults to provider='twilio' for
+      // hand-added rows that don't specify, matching DB default.
       if (method === 'POST' && !id) {
         const pErrors = validatePhoneData(body);
         if (pErrors.length) return respond(400, { error: 'Validation failed', details: pErrors });
         const newId = uuid();
+        const provider = body.provider || 'twilio';
+        if (!['twilio', 'daily'].includes(provider)) {
+          return respond(400, { error: `Invalid provider: ${provider}. Valid: twilio, daily` });
+        }
         const r = await pool.query(
-          `INSERT INTO voice_phone_numbers (id, number, friendly_name)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (number) DO UPDATE SET friendly_name = COALESCE(NULLIF($3, ''), voice_phone_numbers.friendly_name), updated_at = NOW()
+          `INSERT INTO voice_phone_numbers (id, number, friendly_name, provider, daily_number_id)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (number) DO UPDATE SET
+             friendly_name = COALESCE(NULLIF($3, ''), voice_phone_numbers.friendly_name),
+             provider = EXCLUDED.provider,
+             daily_number_id = EXCLUDED.daily_number_id,
+             updated_at = NOW()
            RETURNING *`,
-          [newId, body.number, body.friendly_name || '']
+          [newId, body.number, body.friendly_name || '', provider, body.daily_number_id || null]
         );
         return respond(201, r.rows[0]);
       }
-      // PUT /api/phone-numbers/:id
+      // PUT /api/phone-numbers/:id — assignment + name updates only. Provider
+      // and daily_number_id are set at purchase time and aren't mutable.
       if (method === 'PUT' && id && !sub) {
         const pErrors = validatePhoneData(body);
         if (pErrors.length) return respond(400, { error: 'Validation failed', details: pErrors });
@@ -1185,25 +1208,128 @@ export async function handler(event) {
         const r = await pool.query('SELECT * FROM voice_phone_numbers WHERE id = $1', [id]);
         return respond(200, r.rows[0]);
       }
-      // POST /api/phone-numbers/sync-twilio
+      // POST /api/phone-numbers/sync-twilio — still a stub; Twilio sync is
+      // out of scope for the Daily migration. Kept so the existing
+      // frontend button doesn't 404.
       if (method === 'POST' && id === 'sync-twilio') {
-        // TODO: Call Twilio API to sync numbers
         return respond(200, { total: 0, message: 'Twilio sync not yet configured' });
       }
-      // GET /api/phone-numbers/search
+      // GET /api/phone-numbers/search?provider=daily&areaCode=209&limit=20
+      //                       ?provider=twilio&country=US&area_code=209  (stub)
+      // Provider-aware search. `provider` defaults to 'daily' going forward;
+      // callers that still pass Twilio-style params fall through to the
+      // Twilio stub (which returns an empty list until implemented).
       if (method === 'GET' && id === 'search') {
-        // TODO: Search Twilio for available numbers
-        return respond(200, { numbers: [] });
+        const provider = (qs.provider || 'daily').toLowerCase();
+        if (provider === 'daily') {
+          const areaCode = qs.areaCode || qs.area_code;
+          const region = qs.region;
+          const limit = qs.limit ? Math.min(parseInt(qs.limit, 10) || 30, 100) : 30;
+          if (!areaCode && !region) {
+            return respond(400, { error: 'areaCode (or region) is required for Daily search' });
+          }
+          try {
+            const numbers = await dailyPhoneClient.searchAvailable({ areaCode, region, limit });
+            // Shape matches what the frontend normalizer handles: it accepts
+            // data.available_numbers | data.numbers | data.results | data.
+            // Using `numbers` and including `provider` so the UI can render
+            // the right badge on results.
+            return respond(200, { provider: 'daily', numbers });
+          } catch (err) {
+            const status = err?.statusCode || 500;
+            return respond(status, { error: err.message || 'Daily search failed' });
+          }
+        }
+        if (provider === 'twilio') {
+          // Twilio search is still a stub. Return empty list with a hint so
+          // the frontend can show "no results" without a hard error.
+          return respond(200, {
+            provider: 'twilio',
+            numbers: [],
+            note: 'Twilio search not implemented. Use provider=daily.',
+          });
+        }
+        return respond(400, { error: `Invalid provider: ${provider}. Valid: twilio, daily` });
       }
-      // POST /api/phone-numbers/purchase
-      if (method === 'POST' && id === 'purchase') {
-        // TODO: Purchase via Twilio API
-        return respond(200, { message: 'Twilio purchase not yet configured' });
+      // POST /api/phone-numbers/buy
+      //   body: { provider, number, area_code?, friendly_name? }
+      // Also accepts /purchase as a backcompat alias (frontend cuts over to
+      // /buy in the same PR, but we keep /purchase for one deploy cycle so
+      // a rollback doesn't break the frontend).
+      if (method === 'POST' && (id === 'buy' || id === 'purchase')) {
+        const provider = (body.provider || 'daily').toLowerCase();
+        if (!['twilio', 'daily'].includes(provider)) {
+          return respond(400, { error: `Invalid provider: ${provider}. Valid: twilio, daily` });
+        }
+        if (!body.number) {
+          return respond(400, { error: 'number is required' });
+        }
+        if (provider === 'twilio') {
+          return respond(501, { error: 'Twilio purchase not implemented. Use provider=daily.' });
+        }
+        // Daily: buy the number, then upsert into voice_phone_numbers so
+        // future releases can find the daily_number_id.
+        let purchased;
+        try {
+          purchased = await dailyPhoneClient.buy({ number: body.number });
+        } catch (err) {
+          const status = err?.statusCode || 500;
+          return respond(status, { error: err.message || 'Daily purchase failed' });
+        }
+        const newId = uuid();
+        const r = await pool.query(
+          `INSERT INTO voice_phone_numbers (id, number, friendly_name, provider, daily_number_id)
+           VALUES ($1, $2, $3, 'daily', $4)
+           ON CONFLICT (number) DO UPDATE SET
+             friendly_name = COALESCE(NULLIF($3, ''), voice_phone_numbers.friendly_name),
+             provider = 'daily',
+             daily_number_id = $4,
+             updated_at = NOW()
+           RETURNING *`,
+          [newId, purchased.number, body.friendly_name || '', purchased.id]
+        );
+        return respond(201, r.rows[0]);
       }
-      // POST /api/phone-numbers/:id/release
-      if (method === 'POST' && id && sub === 'release') {
+      // DELETE /api/phone-numbers/:id — provider-aware release.
+      // For Daily numbers, call the Daily API to release the external
+      // resource first; Daily 404 is treated as "already released" and
+      // allows the DB row deletion to proceed (idempotent).
+      // Twilio numbers have no external API call today (sync not impl),
+      // so we just drop the row.
+      if (method === 'DELETE' && id && !sub) {
+        const r = await pool.query('SELECT * FROM voice_phone_numbers WHERE id = $1', [id]);
+        if (!r.rows.length) return respond(404, { error: 'Phone number not found' });
+        const row = r.rows[0];
+        if (row.provider === 'daily' && row.daily_number_id) {
+          try {
+            await dailyPhoneClient.release({ dailyNumberId: row.daily_number_id });
+          } catch (err) {
+            const status = err?.statusCode || 500;
+            return respond(status, { error: err.message || 'Daily release failed' });
+          }
+        }
         await pool.query('DELETE FROM voice_phone_numbers WHERE id = $1', [id]);
-        return respond(200, { released: true });
+        return respond(200, { released: true, provider: row.provider });
+      }
+      // POST /api/phone-numbers/:id/release — backcompat alias. Inlines the
+      // DELETE path above so a rollback of the frontend-PR-then-Lambda-PR
+      // order still works. Mark as deprecated in logs so we notice if
+      // anything still hits it after both PRs merge.
+      if (method === 'POST' && id && sub === 'release') {
+        console.warn('[deprecated] POST /api/phone-numbers/:id/release — use DELETE /api/phone-numbers/:id');
+        const r = await pool.query('SELECT * FROM voice_phone_numbers WHERE id = $1', [id]);
+        if (!r.rows.length) return respond(404, { error: 'Phone number not found' });
+        const row = r.rows[0];
+        if (row.provider === 'daily' && row.daily_number_id) {
+          try {
+            await dailyPhoneClient.release({ dailyNumberId: row.daily_number_id });
+          } catch (err) {
+            const status = err?.statusCode || 500;
+            return respond(status, { error: err.message || 'Daily release failed' });
+          }
+        }
+        await pool.query('DELETE FROM voice_phone_numbers WHERE id = $1', [id]);
+        return respond(200, { released: true, provider: row.provider });
       }
     }
 
