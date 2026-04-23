@@ -1,0 +1,27 @@
+# Dependencies — restored via npm ci from package-lock.json
+node_modules/
+
+# Build outputs
+*.zip
+dist/
+
+# Local env overrides
+.env
+.env.local
+
+# Tooling
+.vscode/
+.idea/
+*.log
+
+# AWS creds scratch
+.aws/
+credentials
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test output
+coverage/
+.nyc_output/
