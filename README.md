@@ -21,17 +21,20 @@ npm ci                           # install deps incl. devDeps for tests
 # Daily loop
 npm test                         # 55 unit tests, 300ms
 
-# Deploy (once your PR is merged to main)
-./scripts/deploy.sh              # test → zip → update-function-code
-                                 #      → publish-version → update-alias
+# Deploy to dev (default — iterate freely, no prompt)
+./scripts/deploy.sh
 
-# Snapshot what's actually live (drift check)
-./scripts/pull-live.sh
+# Deploy to prod (explicit — requires typing "deploy prod" to confirm)
+./scripts/deploy.sh --prod
+
+# Snapshot what's actually live (drift check, stage-aware)
+./scripts/pull-live.sh           # dev by default
+LAMBDA_FUNCTION_NAME=medcloud-voice-api ./scripts/pull-live.sh   # prod
 
 # Emergency rollback — deploy.sh prints the exact command after each
 # deploy; pattern is:
 aws lambda update-alias \
-    --function-name medcloud-voice-api \
+    --function-name medcloud-voice-api       # or -dev \
     --name live \
     --function-version <previous-version-number>
 ```
@@ -109,7 +112,7 @@ All captured via `aws lambda get-function-configuration --function-name medcloud
 | VPC | `vpc-0d1d5235527c7e613` | Shared medcloud VPC, not the voice-engine one |
 | Subnets | `subnet-0ca6883e2bd255a95`, `subnet-03211d6dcea8ecdcb` | Private, with NAT |
 | Security group | `sg-0fa0c00f028a5a13a` | |
-| Separate dev/staging Lambda? | **NO** | Every deploy is production. See Known Issues. |
+| Separate dev/staging Lambda? | `medcloud-voice-api-dev` exists | Clone of prod config; same Aurora DB for now — see Known Issue #3 / GH issue #7. |
 
 ## Environment variables
 
@@ -184,10 +187,28 @@ See Known Issues below.
 3. Open a PR. GitHub Actions runs `npm test` + syntax check +
    production-install smoke test.
 4. Merge to `main` once CI is green.
-5. On a clean checkout of main, run `./scripts/deploy.sh`.
-6. Script prints the new version number and a rollback command
+5. On a clean checkout of main:
+   - **Dev first** (default): `./scripts/deploy.sh` — deploys to
+     `medcloud-voice-api-dev`, no prompt. Invoke
+     `FunctionName=medcloud-voice-api-dev:live` to smoke-test.
+   - **Promote to prod** once dev looks good:
+     `./scripts/deploy.sh --prod`. Script prompts for a typed
+     "deploy prod" confirmation before doing anything destructive.
+6. deploy.sh prints the new version number + a rollback command
    pointing at the previous alias target. Save the rollback command
-   where on-call can find it if something goes wrong.
+   where on-call can find it.
+
+### Stage targets
+
+| Flag | Function name | Prompt? | Who invokes it |
+|------|---------------|---------|----------------|
+| _(none)_ | `medcloud-voice-api-dev` | no | you, ad-hoc smoke tests, future CI deploy-to-dev |
+| `--dev` | `medcloud-voice-api-dev` | no | explicit form of above |
+| `--prod` | `medcloud-voice-api` | yes, typed `deploy prod` | only after dev verification |
+| `--prod --force` | `medcloud-voice-api` | no | emergency-only, skips clean-tree + prompt |
+
+The `LAMBDA_FUNCTION_NAME` env var overrides both (reserved for
+future ad-hoc sandbox Lambdas).
 
 ### Versioning + alias semantics
 
@@ -270,16 +291,21 @@ needs CloudWatch Logs + VPC ENI + one SQS queue + optional Cognito.
 swap via `aws lambda update-function-configuration`. Affects *only*
 this Lambda — other medcloud Lambdas keep using the shared role.
 
-### 3. No dev/staging Lambda
+### 3. Dev Lambda exists but shares the production Aurora DB
 
-Every `deploy.sh` run touches production. The patches we deployed
-in Jan–Apr 2026 were all smoke-tested against live Aurora with
-throwaway agents.
+Resolved partially: `medcloud-voice-api-dev` now exists. `deploy.sh`
+defaults to dev, `--prod` is explicit with confirmation prompt. See
+"Deploy workflow" below.
 
-**Fix**: create `medcloud-voice-api-dev` pointed at a separate
-Aurora schema (or a `medcloud-dev` database on the same cluster).
-Pass `--stage dev` to `deploy.sh` to deploy there. Requires a small
-CDK/CFN stack for the dev Lambda + IAM role + optional VPC.
+**Remaining gap**: the dev Lambda currently points at the SAME
+Aurora DB as prod (host/db/credentials all cloned). Writes from dev
+hit production tables. Until we fix this, dev deploys are safe for
+structural testing (API shape, validators, /api/health) but NOT for
+anything that inserts or mutates rows — use a throwaway agent-name
+pattern and clean up after if you need data-path smoke tests.
+
+Tracked as GitHub issue #7: "Isolate dev Lambda's Aurora DB from
+prod."
 
 ### 4. Bigger refactors tracked as GitHub issues
 

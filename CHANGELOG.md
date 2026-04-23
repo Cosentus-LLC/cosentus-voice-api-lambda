@@ -8,8 +8,47 @@ the focus on *deploy events* since that's the unit of tracking here.
 
 ## Unreleased
 
-_Nothing deployed yet since the repo was created — this section
-accumulates merged PRs until the next deploy._
+_Nothing pending since the last deploy._
+
+---
+
+## 2026-04-23 — first deploys through the new workflow
+
+### Prod: V1 → V2
+
+- **V1** (`1d2901c`): `fix(deploy): --publish false → --no-publish in update-function-code`. First real deploy via `scripts/deploy.sh`. Created `live` alias pointing at V1.
+- **V2** (`62dde81`): `chore: bump to 1.0.2 for rollback drill`. Cut alias V1 → V2. Rolled back alias to V1, verified `/api/health` reported V1's SHA, rolled forward to V2 — end-to-end rollback path verified.
+
+Rollback command pattern (printed by deploy.sh after each deploy):
+
+```
+aws lambda update-alias \
+    --function-name medcloud-voice-api \
+    --name live \
+    --function-version 1
+```
+
+### Dev Lambda created
+
+- `medcloud-voice-api-dev` Lambda created out-of-band via
+  `aws lambda create-function`, config cloned from prod. Same IAM
+  role, VPC, subnets. `STAGE=dev` env var added.
+- **Dev V1** (`15e7640`): first deploy to dev via
+  `./scripts/deploy.sh` (default stage). Alias `live` → V1.
+
+### CloudWatch alarms live
+
+- SNS topic created: `arn:aws:sns:us-east-1:825269749545:voice-api-oncall`
+  (no subscribers yet — on-call adds Slack/email/PagerDuty endpoint).
+- CloudFormation stack `medcloud-voice-api-alarms` deployed from
+  `infrastructure/alarms.yml`, creating three alarms against the
+  production Lambda only:
+  - `medcloud-voice-api-errors` (>=1 error / 5 min)
+  - `medcloud-voice-api-p95-duration` (p95 > 2000ms over 15 min)
+  - `medcloud-voice-api-throttles` (>=1 throttle / 5 min)
+
+Dev Lambda doesn't have alarms — if it's broken the worst outcome
+is the next `deploy --prod` can't be gated on dev smoke tests.
 
 ---
 
