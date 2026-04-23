@@ -174,7 +174,7 @@ aws lambda update-function-code \
     --zip-file "fileb://$ZIP_PATH" \
     --region "$AWS_REGION" \
     --profile "$AWS_PROFILE" \
-    --publish false \
+    --no-publish \
     --output json \
     >/dev/null
 ok "\$LATEST updated"
