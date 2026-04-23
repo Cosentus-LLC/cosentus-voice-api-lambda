@@ -25,3 +25,5 @@ Thumbs.db
 # Test output
 coverage/
 .nyc_output/
+# Ignore deploy artifacts
+.build/
