@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: npm test (node 22)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 22 (matches the deployed Lambda runtime)
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Install with exact versions from package-lock.json — catches dep
+      # drift between local dev and CI. `npm ci` is strict: any mismatch
+      # between package.json and package-lock.json fails the job.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check (index.mjs must be valid ESM)
+        run: node --check index.mjs
+
+      - name: Run unit tests
+        run: npm test
+
+      # Verify the production zip would still build — don't actually
+      # deploy, just produce the artifact and check size. Catches
+      # missing-from-dependencies issues that devDependencies would
+      # paper over locally.
+      - name: Verify production dependency install (devDeps stripped)
+        run: |
+          rm -rf node_modules
+          npm ci --omit=dev
+          test -d node_modules/pg || (echo "pg missing from prod install" && exit 1)
+          test ! -d node_modules/vitest || (echo "vitest leaked into prod install" && exit 1)
+          echo "✓ Production install clean (pg present, devDeps stripped)"

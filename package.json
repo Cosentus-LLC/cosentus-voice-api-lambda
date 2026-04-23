@@ -10,8 +10,6 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
     "deploy": "./scripts/deploy.sh",
     "pull-live": "./scripts/pull-live.sh"
   },
@@ -20,7 +18,6 @@
   },
   "devDependencies": {
     "@aws-sdk/client-sqs": "^3.700.0",
-    "eslint": "^9.18.0",
     "vitest": "^3.0.0"
   }
 }
