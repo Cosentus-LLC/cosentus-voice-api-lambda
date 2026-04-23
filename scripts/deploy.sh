@@ -19,21 +19,34 @@
 # code immediately on step 4 — unchanged from the old workflow.
 #
 # Usage:
-#   ./scripts/deploy.sh              # deploy, require clean tree + main
-#   ./scripts/deploy.sh --force      # skip tree/branch checks (emergency)
+#   ./scripts/deploy.sh              # deploy to DEV (default target)
+#   ./scripts/deploy.sh --prod       # deploy to PROD (with confirmation)
+#   ./scripts/deploy.sh --force      # skip tree/branch checks + prod prompt
 #   ./scripts/deploy.sh --dry-run    # build zip, list contents, don't deploy
+#
+# Stages:
+#   --dev   (default)   → medcloud-voice-api-dev
+#   --prod              → medcloud-voice-api (live traffic)
+#
+# Override by env var: LAMBDA_FUNCTION_NAME=<name> ./scripts/deploy.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-medcloud-voice-api}"
 ALIAS_NAME="${LAMBDA_ALIAS_NAME:-live}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-default}"
 BUILD_DIR="$REPO_ROOT/.build"
 ZIP_PATH="$REPO_ROOT/.build/function.zip"
+
+# Stage-aware function name resolution. Default is `dev` — production
+# deploys require an explicit --prod flag so nobody accidentally ships
+# to prod. $LAMBDA_FUNCTION_NAME env var overrides both if set (e.g.
+# for a future ad-hoc sandbox function).
+STAGE_PROD_NAME="medcloud-voice-api"
+STAGE_DEV_NAME="medcloud-voice-api-dev"
 
 # Colors (only if stdout is a TTY)
 if [ -t 1 ]; then
@@ -52,10 +65,13 @@ err()  { echo -e "${RED}✗${NC} $*" >&2; }
 # ====================
 FORCE=false
 DRY_RUN=false
+STAGE="dev"  # default — --prod to hit production
 for arg in "$@"; do
     case "$arg" in
         --force)   FORCE=true ;;
         --dry-run) DRY_RUN=true ;;
+        --prod)    STAGE="prod" ;;
+        --dev)     STAGE="dev" ;;
         -h|--help)
             sed -n '/^# deploy.sh/,/^$/p' "$0" | sed 's/^# //' | sed 's/^#//'
             exit 0
@@ -66,6 +82,31 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Resolve target function name from stage. LAMBDA_FUNCTION_NAME env var
+# wins over stage flags — kept for future ad-hoc sandbox environments.
+if [ -n "${LAMBDA_FUNCTION_NAME:-}" ]; then
+    FUNCTION_NAME="$LAMBDA_FUNCTION_NAME"
+elif [ "$STAGE" = "prod" ]; then
+    FUNCTION_NAME="$STAGE_PROD_NAME"
+else
+    FUNCTION_NAME="$STAGE_DEV_NAME"
+fi
+
+# Production deploy requires explicit confirmation (unless --force).
+# Dev deploys proceed without prompting — iterate freely.
+if [ "$STAGE" = "prod" ] && ! $FORCE && ! $DRY_RUN; then
+    echo
+    warn "You are about to deploy to PRODUCTION: $FUNCTION_NAME"
+    warn "This is the Lambda serving live voice platform traffic."
+    echo
+    echo "Type 'deploy prod' to proceed, anything else to abort:"
+    read -r CONFIRMATION
+    if [ "$CONFIRMATION" != "deploy prod" ]; then
+        err "Aborted"
+        exit 1
+    fi
+fi
 
 # ====================
 # Preflight
