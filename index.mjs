@@ -697,9 +697,21 @@ export async function handler(event) {
 
   try {
     // ═══ Health ═══
+    // Returns 200 with DB reachability + deploy metadata. Safe to hit
+    // unauthenticated — the frontend's deploy.sh uses this as a smoke test
+    // after each Lambda deploy to verify the expected version is live.
     if (resource === 'health') {
       const r = await pool.query('SELECT 1 as ok');
-      return respond(200, { status: 'healthy', db: r.rows[0]?.ok === 1, version: 'voice-api-v1' });
+      return respond(200, {
+        status: 'healthy',
+        db: r.rows[0]?.ok === 1,
+        version: 'voice-api-1.0.1',
+        // Populated at deploy time by scripts/deploy.sh via an env var so
+        // we can correlate a live /health response to a specific commit
+        // in the cosentus-voice-api-lambda repo. Falls back to 'unknown'
+        // when the env var isn't set (e.g. legacy deploys).
+        git_sha: process.env.BUILD_SHA || 'unknown',
+      });
     }
 
     // ═══ Agent Schema ═══

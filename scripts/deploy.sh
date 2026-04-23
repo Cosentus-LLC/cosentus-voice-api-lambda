@@ -179,14 +179,47 @@ aws lambda update-function-code \
     >/dev/null
 ok "\$LATEST updated"
 
-# Wait for the code update to propagate before publishing a version.
-# Without this, publish-version can race and fail with
-# ResourceConflictException.
-log "Waiting for function to finish updating..."
+# Wait for the code update to propagate before updating config or
+# publishing a version. Without this, subsequent calls race and fail
+# with ResourceConflictException.
+log "Waiting for code update to propagate..."
 aws lambda wait function-updated-v2 \
     --function-name "$FUNCTION_NAME" \
     --region "$AWS_REGION" \
     --profile "$AWS_PROFILE"
+
+# Stamp BUILD_SHA into the Lambda's env so /api/health can report which
+# commit is live. Preserves all existing env vars — this function is not
+# the owner of its env var set (DB_PASS etc. live here too for now; see
+# GitHub issue #1). We fetch-then-merge via python3 rather than the aws
+# CLI's --environment shorthand because DB values can contain special
+# characters that the shorthand parser mishandles.
+log "Stamping BUILD_SHA=$CURRENT_SHA into Lambda env..."
+ENV_PAYLOAD=$(aws lambda get-function-configuration \
+    --function-name "$FUNCTION_NAME" \
+    --query 'Environment.Variables' \
+    --output json \
+    --region "$AWS_REGION" --profile "$AWS_PROFILE" \
+    | python3 -c "
+import json, sys
+current = json.load(sys.stdin) or {}
+current['BUILD_SHA'] = '$CURRENT_SHA'
+print(json.dumps({'Variables': current}))
+")
+
+aws lambda update-function-configuration \
+    --function-name "$FUNCTION_NAME" \
+    --environment "$ENV_PAYLOAD" \
+    --region "$AWS_REGION" --profile "$AWS_PROFILE" \
+    --output json \
+    >/dev/null
+
+log "Waiting for env update to propagate..."
+aws lambda wait function-updated-v2 \
+    --function-name "$FUNCTION_NAME" \
+    --region "$AWS_REGION" \
+    --profile "$AWS_PROFILE"
+ok "BUILD_SHA env var updated"
 
 log "Publishing immutable version..."
 NEW_VERSION=$(aws lambda publish-version \
