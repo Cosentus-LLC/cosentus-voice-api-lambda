@@ -402,6 +402,25 @@ function parseRoute(event) {
 
 const AGENT_COLS = `id, name, display_name, description, llm_provider, llm_model, temperature, max_tokens, enable_prompt_caching, tts_provider, tts_voice_id, tts_model, tts_stability, tts_similarity_boost, tts_style, tts_use_speaker_boost, tts_speed, stt_provider, stt_language, stt_keywords, tools, system_prompt, first_message, ivr_goal, recording_enabled, recording_channels, post_call_analyses, idle_timeout_secs, idle_message, max_call_duration_secs, voicemail_action, voicemail_message, max_retries, retry_delay_secs, default_concurrency, calling_window_start, calling_window_end, calling_window_days, is_active, created_at, updated_at`;
 
+// E.164 validator + normalizer. Used by GET /api/phone-numbers/lookup
+// (Phase 7B bot-runner path). Daily occasionally drops the leading `+`
+// from webhook bodies, so we accept both `+12098075018` and
+// `12098075018` and always store/query with the `+`. Exported for
+// test/phone-lookup.test.mjs.
+//
+// Regex rules:
+//   - starts with `+`
+//   - next digit is 1–9 (no leading zero after the +)
+//   - then 6–14 more digits (E.164 is 8–15 digits total including country code)
+export function normalizeE164(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const withPlus = trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
+  if (!/^\+[1-9]\d{6,14}$/.test(withPlus)) return null;
+  return withPlus;
+}
+
 // ─── Validation constants (shared by schema endpoint + write handlers) ─────
 // NOTE: the following module-level constants and validators are `export`ed
 // purely so the test suite in `test/` can import them. This has zero runtime
@@ -1294,6 +1313,50 @@ export async function handler(event) {
           ORDER BY pn.friendly_name
         `);
         return respond(200, { phone_numbers: r.rows });
+      }
+      // GET /api/phone-numbers/lookup?number=+12098075018
+      //
+      // Phase 7B: bot-runner Lambda hits this on every inbound Daily
+      // webhook to resolve the dialed number → inbound_agent_id. Kept
+      // intentionally narrow (only the fields the bot-runner actually
+      // needs) so caching + observability stay cheap and we're not
+      // leaking full DB rows to every PSTN call. Returns 404 when the
+      // number isn't in voice_phone_numbers at all — callers are
+      // expected to fall back to a DEFAULT_INBOUND_AGENT env var.
+      if (method === 'GET' && id === 'lookup') {
+        const raw = qs.number || '';
+        const number = normalizeE164(raw);
+        if (!number) {
+          return respond(400, {
+            error: `Invalid E.164 number: ${raw}. Expected +<country><subscriber>.`,
+          });
+        }
+        const r = await pool.query(
+          `SELECT pn.id, pn.number, pn.friendly_name, pn.provider,
+                  pn.is_active,
+                  json_build_object(
+                    'id', ia.id, 'name', ia.name, 'display_name', ia.display_name
+                  ) AS inbound_agent,
+                  json_build_object(
+                    'id', oa.id, 'name', oa.name, 'display_name', oa.display_name
+                  ) AS outbound_agent
+           FROM voice_phone_numbers pn
+           LEFT JOIN voice_agents ia ON pn.inbound_agent_id = ia.id
+           LEFT JOIN voice_agents oa ON pn.outbound_agent_id = oa.id
+           WHERE pn.number = $1
+           LIMIT 1`,
+          [number]
+        );
+        if (!r.rows.length) {
+          return respond(404, { detail: 'Phone number not provisioned' });
+        }
+        const row = r.rows[0];
+        // Null out the agent objects when id is null so callers can
+        // just check `inbound_agent === null` rather than inspecting
+        // a row with all-null fields.
+        if (row.inbound_agent && row.inbound_agent.id === null) row.inbound_agent = null;
+        if (row.outbound_agent && row.outbound_agent.id === null) row.outbound_agent = null;
+        return respond(200, row);
       }
       // POST /api/phone-numbers (upsert by number — used for manual adds).
       // Accepts provider + daily_number_id when a number was bought via the
