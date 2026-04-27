@@ -24,9 +24,16 @@
 #   ./scripts/deploy.sh --force      # skip tree/branch checks + prod prompt
 #   ./scripts/deploy.sh --dry-run    # build zip, list contents, don't deploy
 #
+#   ./scripts/deploy.sh --function dispatcher
+#       Deploy the Phase 7D SQS-triggered call dispatcher Lambda
+#       instead of the main API. Same dev/prod stages, separate function
+#       name + handler entry. Useful when only dispatcher.mjs changes.
+#
 # Stages:
 #   --dev   (default)   → medcloud-voice-api-dev
+#                          OR medcloud-voice-call-dispatcher-dev
 #   --prod              → medcloud-voice-api (live traffic)
+#                          OR medcloud-voice-call-dispatcher
 #
 # Override by env var: LAMBDA_FUNCTION_NAME=<name> ./scripts/deploy.sh
 
@@ -45,8 +52,17 @@ ZIP_PATH="$REPO_ROOT/.build/function.zip"
 # deploys require an explicit --prod flag so nobody accidentally ships
 # to prod. $LAMBDA_FUNCTION_NAME env var overrides both if set (e.g.
 # for a future ad-hoc sandbox function).
-STAGE_PROD_NAME="medcloud-voice-api"
-STAGE_DEV_NAME="medcloud-voice-api-dev"
+STAGE_PROD_NAME_API="medcloud-voice-api"
+STAGE_DEV_NAME_API="medcloud-voice-api-dev"
+STAGE_PROD_NAME_DISPATCHER="medcloud-voice-call-dispatcher"
+STAGE_DEV_NAME_DISPATCHER="medcloud-voice-call-dispatcher-dev"
+
+# Per-function build hints. The dispatcher Lambda's handler entry is
+# dispatcher.handler (file: dispatcher.mjs) — different from the main
+# API which is index.handler (file: index.mjs). The build step copies
+# the right entry file + lib/ regardless, so this only matters for
+# documentation in deploy logs.
+FUNCTION_TARGET="api"   # "api" (default) or "dispatcher"
 
 # Colors (only if stdout is a TTY)
 if [ -t 1 ]; then
@@ -66,12 +82,26 @@ err()  { echo -e "${RED}✗${NC} $*" >&2; }
 FORCE=false
 DRY_RUN=false
 STAGE="dev"  # default — --prod to hit production
-for arg in "$@"; do
+ARGS=("$@")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+    arg="${ARGS[$i]}"
     case "$arg" in
         --force)   FORCE=true ;;
         --dry-run) DRY_RUN=true ;;
         --prod)    STAGE="prod" ;;
         --dev)     STAGE="dev" ;;
+        --function)
+            i=$((i + 1))
+            if [ $i -ge ${#ARGS[@]} ]; then
+                err "--function requires an argument (api|dispatcher)"
+                exit 2
+            fi
+            FUNCTION_TARGET="${ARGS[$i]}"
+            ;;
+        --function=*)
+            FUNCTION_TARGET="${arg#--function=}"
+            ;;
         -h|--help)
             sed -n '/^# deploy.sh/,/^$/p' "$0" | sed 's/^# //' | sed 's/^#//'
             exit 0
@@ -81,7 +111,28 @@ for arg in "$@"; do
             exit 2
             ;;
     esac
+    i=$((i + 1))
 done
+
+# Resolve target name + handler entry from --function selection.
+case "$FUNCTION_TARGET" in
+    api)
+        STAGE_PROD_NAME="$STAGE_PROD_NAME_API"
+        STAGE_DEV_NAME="$STAGE_DEV_NAME_API"
+        HANDLER_ENTRY="index.mjs"
+        HANDLER_NAME="index.handler"
+        ;;
+    dispatcher)
+        STAGE_PROD_NAME="$STAGE_PROD_NAME_DISPATCHER"
+        STAGE_DEV_NAME="$STAGE_DEV_NAME_DISPATCHER"
+        HANDLER_ENTRY="dispatcher.mjs"
+        HANDLER_NAME="dispatcher.handler"
+        ;;
+    *)
+        err "Unknown --function target: $FUNCTION_TARGET (must be 'api' or 'dispatcher')"
+        exit 2
+        ;;
+esac
 
 # Resolve target function name from stage. LAMBDA_FUNCTION_NAME env var
 # wins over stage flags — kept for future ad-hoc sandbox environments.
@@ -143,6 +194,7 @@ IDENTITY=$(aws sts get-caller-identity --query Arn --output text --region "$AWS_
 log "AWS account: $ACCOUNT"
 log "Identity:    $IDENTITY"
 log "Function:    $FUNCTION_NAME"
+log "Target:      $FUNCTION_TARGET ($HANDLER_NAME)"
 log "Region:      $AWS_REGION"
 log "Alias:       $ALIAS_NAME"
 echo
@@ -165,7 +217,11 @@ mkdir -p "$BUILD_DIR"
 # Fresh install with prod deps only.
 STAGE_DIR="$BUILD_DIR/stage"
 mkdir -p "$STAGE_DIR"
-cp index.mjs package.json package-lock.json "$STAGE_DIR/"
+# Always include both entry files in the zip — Lambda only invokes the
+# one configured as the function's Handler, and the few extra KB are
+# negligible. This keeps the build reproducible regardless of which
+# --function target was selected.
+cp index.mjs dispatcher.mjs package.json package-lock.json "$STAGE_DIR/"
 
 # Copy any additional source directories (e.g. lib/ helpers). Anything that
 # index.mjs imports relatively (./lib/foo.mjs, ./helpers/bar.mjs, etc.) must
