@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Phase 7D call-dispatcher Lambda alarms (errors, throttles, DLQ depth,
+  p95 duration). Covers the four failure classes most likely to bite
+  once SQS is wired up. See per-resource AlarmDescription for runbook
+  details; deploy via aws cloudformation deploy --template-file
+  infrastructure/dispatcher-alarms.yml.
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: medcloud-voice-call-dispatcher
+    Description: >
+      Lambda function name to alarm on. Use
+      `medcloud-voice-call-dispatcher-dev` for the dev stage.
+
+  QueueName:
+    Type: String
+    Default: medcloud-voice-call-requests
+    Description: >
+      SQS queue feeding the dispatcher. The DLQ name is derived as
+      `${QueueName}-dlq` per the existing infrastructure convention.
+
+  AlertTopicArn:
+    Type: String
+    Description: >
+      SNS topic that receives alarm notifications. Reuse the same
+      voice-api-oncall topic that infrastructure/alarms.yml uses
+      so paged on-call sees both API and dispatcher errors in one
+      place.
+
+  ErrorThreshold:
+    Type: Number
+    Default: 1
+    Description: >
+      Minimum errors per 5-minute window that triggers the error alarm.
+      Set low (1) during stabilization; bump to 3+ once we have real
+      baseline traffic and a clean week.
+
+  ThrottleThreshold:
+    Type: Number
+    Default: 1
+    Description: >
+      Throttles per 5-minute window. Should be 0 at steady state.
+      Hitting this means SQS delivered more than ReservedConcurrency
+      can handle simultaneously — either raise concurrency, or check
+      whether a runaway producer is firehose-pumping the queue.
+
+  DlqMessageThreshold:
+    Type: Number
+    Default: 1
+    Description: >
+      Messages in the DLQ per 5-minute window that triggers an alarm.
+      DLQ should be empty at steady state. Anything in there means a
+      message hit maxReceiveCount=3 — investigate the underlying
+      voice_call_requests row(s) and the dispatcher logs for the
+      MessageId.
+
+  P95DurationThresholdMs:
+    Type: Number
+    Default: 5000
+    Description: >
+      p95 invocation duration ceiling per 5-minute window. Healthy
+      dispatch is <2s end-to-end (Aurora claim + Lambda invoke +
+      status write). 5s is "starting to feel slow" and worth a look
+      before it becomes a queue-backup cascade.
+
+Resources:
+  ErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-errors'
+      AlarmDescription: >
+        Dispatcher Lambda raised one or more uncaught exceptions in
+        the last 5 minutes. Common causes: missing env vars after a
+        bad deploy, IAM policy regression, Aurora connection storm,
+        bot-runner ARN drift after CDK redeploy. Check CloudWatch
+        Logs for the stack trace; also check
+        infrastructure/alarms.yml semantics — these alarms mirror
+        the API ones.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-throttles'
+      AlarmDescription: >
+        Lambda reserved concurrency exhausted — some SQS-triggered
+        invocations were throttled. Default cap is 10. Raise the
+        function's reserved-concurrent-executions if this fires
+        sustained, OR investigate the producer (medcloud-voice-api
+        POST /api/call-requests) for runaway loops.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ThrottleThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+  DlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-dlq-depth'
+      AlarmDescription: >
+        One or more messages landed in the DLQ. By the time SQS
+        redirects to DLQ the dispatcher has already retried 3 times
+        (maxReceiveCount=3). Treat as a high-signal event:
+          1. Read the DLQ messages — extract `request_id` from each.
+          2. Check voice_call_requests rows for those ids: status,
+             attempt_count, error_message.
+          3. Check dispatcher CloudWatch logs filtered by request_id.
+          4. Re-enqueue from DLQ once the underlying issue is fixed.
+        Common causes: bot-runner returning 5xx (Daily downstream
+        outage), Aurora unreachable from the Lambda VPC.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${QueueName}-dlq'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DlqMessageThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+  P95DurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-p95-duration'
+      AlarmDescription: >
+        p95 invocation duration exceeded threshold for 15+ minutes
+        (3 evaluation periods of 5 min). Sustained elevated p95
+        usually points to:
+          - Aurora performance — check RDS Performance Insights for
+            the dispatcher's UPDATE voice_call_requests query.
+          - Bot-runner cold starts — if dispatcher is rarely invoked,
+            every dispatch triggers a bot-runner cold start.
+            Consider warming with a scheduled ping if traffic is
+            sparse.
+          - Lambda VPC ENI exhaustion — check VPC subnet ENI count.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref P95DurationThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+      OKActions:
+        - !Ref AlertTopicArn
+
+Outputs:
+  ErrorAlarmArn:
+    Value: !GetAtt ErrorRateAlarm.Arn
+  ThrottleAlarmArn:
+    Value: !GetAtt ThrottleAlarm.Arn
+  DlqDepthAlarmArn:
+    Value: !GetAtt DlqDepthAlarm.Arn
+  P95DurationAlarmArn:
+    Value: !GetAtt P95DurationAlarm.Arn
