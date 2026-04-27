@@ -10,6 +10,10 @@
 // surface. Keep it small enough to read at a glance.
 
 import { Lambda, InvokeCommand } from '@aws-sdk/client-lambda';
+import {
+  SQSClient,
+  ChangeMessageVisibilityCommand,
+} from '@aws-sdk/client-sqs';
 import pg from 'pg';
 
 import {
@@ -32,6 +36,9 @@ import {
 const BOT_RUNNER_FUNCTION_NAME = process.env.BOT_RUNNER_FUNCTION_NAME
   || 'voice-agent-poc-bot-runner';
 
+const CALL_QUEUE_URL = process.env.CALL_QUEUE_URL
+  || 'https://sqs.us-east-1.amazonaws.com/825269749545/medcloud-voice-call-requests';
+
 const PG_POOL_MAX = Number(process.env.PG_POOL_MAX || '2');
 
 // ────────────────────────────────────────────────────────────────────
@@ -39,6 +46,7 @@ const PG_POOL_MAX = Number(process.env.PG_POOL_MAX || '2');
 // warm invocations skip the connection-setup cost.
 
 const lambdaClient = new Lambda({});
+const sqsClient = new SQSClient({});
 
 const pool = new pg.Pool({
   host: process.env.DB_HOST,
@@ -165,6 +173,101 @@ async function callDialOut(payload) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Batch-source deps (Phase 7D PR 2). These mirror the call_request
+// shape: an atomic claim, a best-effort status writer, and a parent
+// lookup. Plus changeMessageVisibility for the polite-defer outcomes
+// (paused / outside-calling-window) — those return the SQS message
+// without throwing, so the batch isn't penalized in the per-message
+// retry counter.
+
+/**
+ * Look up a voice_batches row by id. Returns null when the batch
+ * doesn't exist (caller treats that as "ack and skip"). The
+ * dispatcher hot path only reads .status + .paused_by_user, so we
+ * only SELECT what we need.
+ */
+async function getBatch(batchId) {
+  const r = await pool.query(
+    `SELECT id, status, paused_by_user
+       FROM voice_batches
+      WHERE id = $1`,
+    [batchId],
+  );
+  return r.rows[0] || null;
+}
+
+/**
+ * Atomically claim a batch row. Same pattern as claimRow for the
+ * call_request path: only transition queued/pending → dialing.
+ * Returns the claimed row, or null if 0 rows matched (already in
+ * a terminal or in-flight state).
+ */
+async function claimBatchRow(batchRowId) {
+  const r = await pool.query(
+    `UPDATE voice_batch_rows
+        SET status = 'dialing',
+            attempt_count = COALESCE(attempt_count, 0) + 1,
+            updated_at = NOW()
+      WHERE id = $1
+        AND status IN ('queued', 'pending')
+      RETURNING *;`,
+    [batchRowId],
+  );
+  return r.rows[0] || null;
+}
+
+/**
+ * Best-effort status writer for voice_batch_rows. Only used for
+ * fail-fast paths (validation / 4xx); successful dispatches leave
+ * the row at 'dialing' for the after-call hook to terminalize via
+ * POST /api/calls. Never throws.
+ */
+async function markBatchRowStatus(batchRowId, status, fields = {}) {
+  try {
+    const cols = ['status = $2', 'updated_at = NOW()'];
+    const vals = [batchRowId, status];
+    if (fields.error_message !== undefined) {
+      vals.push(String(fields.error_message).slice(0, 1000));
+      cols.push(`error_message = $${vals.length}`);
+    }
+    const sql = `UPDATE voice_batch_rows SET ${cols.join(', ')} WHERE id = $1`;
+    await pool.query(sql, vals);
+  } catch (e) {
+    console.error('[dispatcher] markBatchRowStatus failed', {
+      batchRowId,
+      status,
+      error: e.message,
+    });
+  }
+}
+
+/**
+ * Re-arm a SQS message for redelivery in `secs` seconds without
+ * counting a failure attempt. Used by the batch path for "polite
+ * defer" outcomes (outside calling window, batch paused). The SQS
+ * partial-batch-response mechanism re-delivers immediately on
+ * throw which would burn through maxReceiveCount=3 — change-message
+ * -visibility lets us pace.
+ */
+async function changeMessageVisibility(receiptHandle, secs) {
+  if (!receiptHandle) return;
+  try {
+    await sqsClient.send(new ChangeMessageVisibilityCommand({
+      QueueUrl: CALL_QUEUE_URL,
+      ReceiptHandle: receiptHandle,
+      VisibilityTimeout: secs,
+    }));
+  } catch (e) {
+    // Surface to the core's logger; not fatal — at worst the message
+    // re-delivers immediately and we re-defer next round.
+    console.warn('[dispatcher] changeMessageVisibility failed', {
+      secs,
+      error: e.message,
+    });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Lambda handler — kept thin. processBatch returns the partial-batch
 // response shape SQS expects when ReportBatchItemFailures is on.
 
@@ -177,7 +280,17 @@ export const handler = async (event, context) => {
 
   return processBatch({
     event,
-    deps: { claimRow, markStatus, callDialOut },
+    deps: {
+      // call_request path
+      claimRow,
+      markStatus,
+      callDialOut,
+      // batch path (Phase 7D PR 2)
+      getBatch,
+      claimBatchRow,
+      markBatchRowStatus,
+      changeMessageVisibility,
+    },
     logger: console,
   });
 };

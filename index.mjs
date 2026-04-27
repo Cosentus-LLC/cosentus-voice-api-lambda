@@ -1107,12 +1107,32 @@ export async function handler(event) {
         return respond(200, { url: r.rows[0].recording_path });
       }
       // POST /api/calls — upsert call record (used by calling engine)
+      //
+      // Phase 7E PR 1 wired this from the ECS pipeline. Phase 7D
+      // follow-up adds three things on top:
+      //
+      //   1. batch_row_index column in the INSERT — was dropped
+      //      in PR #25 (small typo: column was in the table schema
+      //      but missing from the INSERT column list, so every
+      //      batch-call row had NULL batch_row_index. Frontend
+      //      can't join to voice_batch_rows without it).
+      //
+      //   2. Mirror status into voice_batch_rows when batch_id +
+      //      batch_row_index are present. The pipeline writes
+      //      voice_calls; voice_batch_rows is the dispatcher's
+      //      view — it needs the terminal status too so the row
+      //      doesn't sit at 'dialing' forever.
+      //
+      //   3. Auto-finalize the parent voice_batches row when all
+      //      child rows reach a terminal status. Ports OG's
+      //      _check_batch_completion behavior so the UI dashboard
+      //      doesn't show "running" forever.
       if (method === 'POST' && !id) {
         const c = body;
         const callId = c.id || uuid();
         await pool.query(
-          `INSERT INTO voice_calls (id, agent_name, agent_display_name, from_number, target_number, direction, status, started_at, ended_at, duration_secs, case_data, transcript, recording_path, post_call_analyses, error, batch_id, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          `INSERT INTO voice_calls (id, agent_name, agent_display_name, from_number, target_number, direction, status, started_at, ended_at, duration_secs, case_data, transcript, recording_path, post_call_analyses, error, batch_id, batch_row_index, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
            ON CONFLICT (id) DO UPDATE SET
              status = COALESCE(EXCLUDED.status, voice_calls.status),
              ended_at = COALESCE(EXCLUDED.ended_at, voice_calls.ended_at),
@@ -1121,9 +1141,70 @@ export async function handler(event) {
              recording_path = COALESCE(EXCLUDED.recording_path, voice_calls.recording_path),
              post_call_analyses = CASE WHEN EXCLUDED.post_call_analyses::text != '{}' THEN EXCLUDED.post_call_analyses ELSE voice_calls.post_call_analyses END,
              error = COALESCE(EXCLUDED.error, voice_calls.error),
+             batch_row_index = COALESCE(EXCLUDED.batch_row_index, voice_calls.batch_row_index),
              updated_at = EXCLUDED.updated_at`,
-          [callId, c.agent_name, c.agent_display_name, c.from_number, c.target_number||'', c.direction||'outbound', c.status||'completed', c.started_at, c.ended_at, c.duration_secs, JSON.stringify(c.case_data||{}), JSON.stringify(c.transcript||[]), c.recording_path, JSON.stringify(c.post_call_analyses||{}), c.error||null, c.batch_id||null, c.created_at||new Date().toISOString(), c.updated_at||new Date().toISOString()]
+          [callId, c.agent_name, c.agent_display_name, c.from_number, c.target_number||'', c.direction||'outbound', c.status||'completed', c.started_at, c.ended_at, c.duration_secs, JSON.stringify(c.case_data||{}), JSON.stringify(c.transcript||[]), c.recording_path, JSON.stringify(c.post_call_analyses||{}), c.error||null, c.batch_id||null, c.batch_row_index ?? null, c.created_at||new Date().toISOString(), c.updated_at||new Date().toISOString()]
         );
+
+        // Best-effort batch-row + batch finalization. None of these
+        // updates are the call-record write's responsibility, but
+        // they're cheap enough to do inline and avoid a second
+        // round-trip from the pipeline. Wrapped in try/catch so a
+        // failure here never breaks the primary upsert.
+        if (c.batch_id && c.batch_row_index !== undefined && c.batch_row_index !== null) {
+          try {
+            // Map voice_calls.status → voice_batch_rows.status. Both
+            // tables share most vocabulary (completed/failed/etc),
+            // so this is largely a passthrough. Gate explicit
+            // unknown values to a safe default.
+            const callStatus = c.status || 'completed';
+            const ROW_STATUS_MAP = {
+              completed: 'completed',
+              failed: 'failed',
+              no_answer: 'no_answer',
+              busy: 'busy',
+              cancelled: 'cancelled',
+              skipped: 'skipped',
+            };
+            const rowStatus = ROW_STATUS_MAP[callStatus] || 'completed';
+
+            await pool.query(
+              `UPDATE voice_batch_rows
+                  SET status = $1,
+                      call_id = $2,
+                      error_message = COALESCE($3, error_message),
+                      updated_at = NOW()
+                WHERE batch_id = $4 AND row_index = $5`,
+              [rowStatus, callId, c.error || null, c.batch_id, c.batch_row_index]
+            );
+
+            // Auto-finalize. Mirrors OG voiceagent's
+            // _check_batch_completion: if no rows are still in a
+            // non-terminal state, flip the batch to 'completed'.
+            // The IS DISTINCT FROM check makes this UPDATE a no-op
+            // when there's nothing to do, so it's safe to fire on
+            // every after-call write.
+            await pool.query(
+              `UPDATE voice_batches
+                  SET status = 'completed',
+                      completed_rows = (SELECT COUNT(*) FROM voice_batch_rows WHERE batch_id = $1 AND status = 'completed'),
+                      failed_rows    = (SELECT COUNT(*) FROM voice_batch_rows WHERE batch_id = $1 AND status IN ('failed','no_answer','busy')),
+                      updated_at = NOW()
+                WHERE id = $1
+                  AND status IS DISTINCT FROM 'completed'
+                  AND status IS DISTINCT FROM 'cancelled'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM voice_batch_rows
+                     WHERE batch_id = $1
+                       AND status NOT IN ('completed','failed','no_answer','busy','cancelled','skipped')
+                  )`,
+              [c.batch_id]
+            );
+          } catch (e) {
+            console.error('[voice-api] post-call batch update failed', { batch_id: c.batch_id, batch_row_index: c.batch_row_index, error: e.message });
+          }
+        }
+
         return respond(201, { id: callId });
       }
       // PUT /api/calls/:id/hide — soft-delete a call
@@ -1266,13 +1347,35 @@ export async function handler(event) {
         return respond(200, { ok: true, total_rows: valid.length, ready: valid.length });
       }
       // POST /api/batches/:id/start
+      //
+      // Phase 7D: this used to be a TODO. Now wired to the JS port
+      // of OG voiceagent's server/batch_queue.py:start_batch — apply
+      // any caller-supplied schedule overrides, then fan out
+      // pending rows to SQS via lib/batch-enqueuer.mjs. The
+      // dispatcher Lambda picks them up from the queue.
       if (method === 'POST' && id && sub === 'start') {
+        // Apply schedule + window overrides FIRST so the row-builder
+        // (which reads from voice_batches) sees the latest values.
         await pool.query(
           `UPDATE voice_batches SET status = $1, concurrency = $2, timezone = $3, calling_window_start = $4, calling_window_end = $5, calling_window_days = $6, updated_at = NOW() WHERE id = $7`,
           [body.schedule_mode === 'scheduled' ? 'scheduled' : 'running', body.concurrency || 1, body.timezone || null, body.calling_window_start || null, body.calling_window_end || null, body.calling_window_days ? JSON.stringify(body.calling_window_days) : null, id]
         );
-        // TODO: Trigger actual batch calling via voice engine
-        return respond(200, { status: 'started', batch_id: id });
+
+        // Scheduled batches don't fire enqueue immediately — the
+        // batch sits at status='scheduled' and a future cron / API
+        // call should re-POST start without schedule_mode to fan
+        // out. Match OG behavior.
+        if (body.schedule_mode === 'scheduled') {
+          return respond(200, { status: 'scheduled', batch_id: id });
+        }
+
+        const enqueuer = await import('./lib/batch-enqueuer.mjs');
+        const result = await enqueuer.start(pool, sqsClient, id, CALL_QUEUE_URL);
+        const httpStatus = result.http_status || 200;
+        // strip the http_status field from the public response — it
+        // was only the channel for the validator's intent.
+        const { http_status, ...payload } = result;
+        return respond(httpStatus, payload);
       }
       // POST /api/batches/:id/pause|resume|cancel
       if (method === 'POST' && id && ['pause', 'resume', 'cancel'].includes(sub)) {
