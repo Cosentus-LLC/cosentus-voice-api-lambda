@@ -199,6 +199,7 @@ async function ensureTables() {
       error TEXT,
       batch_id UUID,
       batch_row_index INTEGER,
+      session_id VARCHAR(100),
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -206,6 +207,11 @@ async function ensureTables() {
     `CREATE INDEX IF NOT EXISTS idx_vc_status ON voice_calls(status)`,
     `CREATE INDEX IF NOT EXISTS idx_vc_batch ON voice_calls(batch_id)`,
     `CREATE INDEX IF NOT EXISTS idx_vc_created ON voice_calls(created_at DESC)`,
+    // Phase 7E PR 3: session_id correlates voice_calls to Daily's room_name
+    // (and any other per-call artifact key). The recording webhook arrives
+    // with payload.room_name and we use it to find the row to patch
+    // recording_path on. Indexed for the lookup.
+    `CREATE INDEX IF NOT EXISTS idx_vc_session ON voice_calls(session_id)`,
     // Batches
     `CREATE TABLE IF NOT EXISTS voice_batches (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -373,6 +379,11 @@ async function ensureTables() {
     `ALTER TABLE voice_phone_numbers ADD COLUMN IF NOT EXISTS provider VARCHAR(20) NOT NULL DEFAULT 'twilio'`,
     `ALTER TABLE voice_phone_numbers ADD COLUMN IF NOT EXISTS daily_number_id UUID`,
     `ALTER TABLE voice_phone_numbers ADD CONSTRAINT voice_phone_numbers_provider_valid CHECK (provider IN ('twilio', 'daily')) NOT VALID`,
+    // Phase 7E PR 3: session_id correlates voice_calls rows to Daily room_name
+    // (= what the recording webhook brings back). Idempotent ALTER + index
+    // for existing deployments that pre-date the CREATE TABLE addition.
+    `ALTER TABLE voice_calls ADD COLUMN IF NOT EXISTS session_id VARCHAR(100)`,
+    `CREATE INDEX IF NOT EXISTS idx_vc_session ON voice_calls(session_id)`,
   ];
   for (const sql of migrations) {
     try { await pool.query(sql); } catch (e) { console.warn('[voice-api] Migration warning:', e.message?.substring(0, 100)); }
@@ -1131,8 +1142,8 @@ export async function handler(event) {
         const c = body;
         const callId = c.id || uuid();
         await pool.query(
-          `INSERT INTO voice_calls (id, agent_name, agent_display_name, from_number, target_number, direction, status, started_at, ended_at, duration_secs, case_data, transcript, recording_path, post_call_analyses, error, batch_id, batch_row_index, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          `INSERT INTO voice_calls (id, agent_name, agent_display_name, from_number, target_number, direction, status, started_at, ended_at, duration_secs, case_data, transcript, recording_path, post_call_analyses, error, batch_id, batch_row_index, session_id, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
            ON CONFLICT (id) DO UPDATE SET
              status = COALESCE(EXCLUDED.status, voice_calls.status),
              ended_at = COALESCE(EXCLUDED.ended_at, voice_calls.ended_at),
@@ -1142,8 +1153,9 @@ export async function handler(event) {
              post_call_analyses = CASE WHEN EXCLUDED.post_call_analyses::text != '{}' THEN EXCLUDED.post_call_analyses ELSE voice_calls.post_call_analyses END,
              error = COALESCE(EXCLUDED.error, voice_calls.error),
              batch_row_index = COALESCE(EXCLUDED.batch_row_index, voice_calls.batch_row_index),
+             session_id = COALESCE(EXCLUDED.session_id, voice_calls.session_id),
              updated_at = EXCLUDED.updated_at`,
-          [callId, c.agent_name, c.agent_display_name, c.from_number, c.target_number||'', c.direction||'outbound', c.status||'completed', c.started_at, c.ended_at, c.duration_secs, JSON.stringify(c.case_data||{}), JSON.stringify(c.transcript||[]), c.recording_path, JSON.stringify(c.post_call_analyses||{}), c.error||null, c.batch_id||null, c.batch_row_index ?? null, c.created_at||new Date().toISOString(), c.updated_at||new Date().toISOString()]
+          [callId, c.agent_name, c.agent_display_name, c.from_number, c.target_number||'', c.direction||'outbound', c.status||'completed', c.started_at, c.ended_at, c.duration_secs, JSON.stringify(c.case_data||{}), JSON.stringify(c.transcript||[]), c.recording_path, JSON.stringify(c.post_call_analyses||{}), c.error||null, c.batch_id||null, c.batch_row_index ?? null, c.session_id || null, c.created_at||new Date().toISOString(), c.updated_at||new Date().toISOString()]
         );
 
         // Best-effort batch-row + batch finalization. None of these
@@ -1212,6 +1224,41 @@ export async function handler(event) {
         const r = await pool.query('UPDATE voice_calls SET hidden = true WHERE id = $1 RETURNING id', [id]);
         if (!r.rows.length) return respond(404, { detail: 'Call not found' });
         return respond(200, { status: 'hidden', id: r.rows[0].id });
+      }
+      // POST /api/calls/recording-update
+      //
+      // Phase 7E PR 3: Daily's recording.ready-to-download webhook
+      // arrives with `room_name` (= our session_id) and `s3_key`. The
+      // bot-runner's webhook handler calls this endpoint to patch
+      // voice_calls.recording_path. We look up by session_id, not by
+      // primary key — the webhook doesn't know voice_calls.id.
+      //
+      // Idempotent: if the row's recording_path is already set,
+      // overwrite (Daily can re-emit the event after a retry; the
+      // s3_key is stable so the value doesn't change). If no row
+      // matches the session_id, return 404 — that's a programming
+      // bug (Daily room name out of sync with our session_id), not
+      // a transient that should be retried.
+      if (method === 'POST' && id === 'recording-update') {
+        const sessionId = body.session_id || body.room_name;
+        const recordingPath = body.recording_path;
+        if (!sessionId) return respond(400, { detail: 'session_id (or room_name) required' });
+        if (!recordingPath) return respond(400, { detail: 'recording_path required' });
+        const r = await pool.query(
+          `UPDATE voice_calls
+              SET recording_path = $1,
+                  updated_at = NOW()
+            WHERE session_id = $2
+            RETURNING id, session_id, recording_path`,
+          [recordingPath, sessionId]
+        );
+        if (!r.rows.length) {
+          return respond(404, {
+            detail: 'No voice_calls row matches that session_id',
+            session_id: sessionId,
+          });
+        }
+        return respond(200, r.rows[0]);
       }
       // GET /api/calls/:id
       if (method === 'GET' && id && !sub) {
