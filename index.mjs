@@ -118,6 +118,7 @@ async function ensureTables() {
       calling_window_end VARCHAR(10) DEFAULT '17:00',
       calling_window_days TEXT[] DEFAULT '{mon,tue,wed,thu,fri}',
       is_active BOOLEAN DEFAULT true,
+      speak_first BOOLEAN NOT NULL DEFAULT true,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -163,6 +164,7 @@ async function ensureTables() {
       calling_window_end VARCHAR(10) DEFAULT '17:00',
       calling_window_days TEXT[] DEFAULT '{mon,tue,wed,thu,fri}',
       has_unpublished_changes BOOLEAN DEFAULT false,
+      speak_first BOOLEAN NOT NULL DEFAULT true,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -384,6 +386,13 @@ async function ensureTables() {
     // for existing deployments that pre-date the CREATE TABLE addition.
     `ALTER TABLE voice_calls ADD COLUMN IF NOT EXISTS session_id VARCHAR(100)`,
     `CREATE INDEX IF NOT EXISTS idx_vc_session ON voice_calls(session_id)`,
+    // v2 Layer 1 follow-up: speak_first controls whether the bot
+    // generates an opening message or waits for the user. Defaults
+    // to true so every existing agent keeps its current behavior
+    // (all agents in production today implicitly speak first via a
+    // non-empty first_message).
+    `ALTER TABLE voice_agents       ADD COLUMN IF NOT EXISTS speak_first BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE voice_agent_drafts ADD COLUMN IF NOT EXISTS speak_first BOOLEAN NOT NULL DEFAULT true`,
   ];
   for (const sql of migrations) {
     try { await pool.query(sql); } catch (e) { console.warn('[voice-api] Migration warning:', e.message?.substring(0, 100)); }
@@ -411,7 +420,7 @@ function parseRoute(event) {
   return { path, method, qs, body, resource, id, sub, parts };
 }
 
-const AGENT_COLS = `id, name, display_name, description, llm_provider, llm_model, temperature, max_tokens, enable_prompt_caching, tts_provider, tts_voice_id, tts_model, tts_stability, tts_similarity_boost, tts_style, tts_use_speaker_boost, tts_speed, stt_provider, stt_language, stt_keywords, tools, system_prompt, first_message, ivr_goal, recording_enabled, recording_channels, post_call_analyses, idle_timeout_secs, idle_message, max_call_duration_secs, voicemail_action, voicemail_message, max_retries, retry_delay_secs, default_concurrency, calling_window_start, calling_window_end, calling_window_days, is_active, created_at, updated_at`;
+const AGENT_COLS = `id, name, display_name, description, llm_provider, llm_model, temperature, max_tokens, enable_prompt_caching, tts_provider, tts_voice_id, tts_model, tts_stability, tts_similarity_boost, tts_style, tts_use_speaker_boost, tts_speed, stt_provider, stt_language, stt_keywords, tools, system_prompt, first_message, ivr_goal, recording_enabled, recording_channels, post_call_analyses, idle_timeout_secs, idle_message, max_call_duration_secs, voicemail_action, voicemail_message, max_retries, retry_delay_secs, default_concurrency, calling_window_start, calling_window_end, calling_window_days, is_active, speak_first, created_at, updated_at`;
 
 // E.164 validator + normalizer. Used by GET /api/phone-numbers/lookup
 // (Phase 7B bot-runner path). Daily occasionally drops the leading `+`
@@ -539,6 +548,10 @@ export function buildRuntimeConfig(row) {
     system_prompt: row.system_prompt || '',
     first_message: row.first_message || '',
     ivr_goal: row.ivr_goal || '',
+    // v2 Layer 1 follow-up. Defaults to true for any pre-migration
+    // row where the column is null (shouldn't happen — column is
+    // NOT NULL — but defensive coalesce matches every other field).
+    speak_first: row.speak_first === false ? false : true,
     llm: {
       provider: row.llm_provider || 'anthropic',
       model: row.llm_model || 'claude-sonnet-4-6',
@@ -885,8 +898,8 @@ export async function handler(event) {
         const existing = await pool.query('SELECT id FROM voice_agents WHERE name = $1', [name]);
         if (existing.rows.length) return respond(409, { detail: `Agent "${name}" already exists` });
         const newId = uuid();
-        const cols = ['id', 'name', 'display_name', 'description', 'llm_provider', 'llm_model', 'temperature', 'max_tokens', 'system_prompt', 'first_message', 'tts_provider', 'tts_voice_id', 'tts_model', 'tools', 'post_call_analyses', 'stt_provider', 'stt_language'];
-        const vals = [newId, name, body.display_name || name, body.description || '', body.llm_provider || 'anthropic', body.llm_model || 'us.anthropic.claude-sonnet-4-6', body.temperature ?? 0.7, body.max_tokens ?? 1024, body.system_prompt || '', body.first_message || '', body.tts_provider || 'elevenlabs', body.tts_voice_id || '', body.tts_model || 'eleven_turbo_v2_5', JSON.stringify(body.tools || []), JSON.stringify(body.post_call_analyses || { model: 'us.anthropic.claude-haiku-4-5-20251001', fields: [] }), body.stt_provider || 'elevenlabs', body.stt_language || 'en'];
+        const cols = ['id', 'name', 'display_name', 'description', 'llm_provider', 'llm_model', 'temperature', 'max_tokens', 'system_prompt', 'first_message', 'tts_provider', 'tts_voice_id', 'tts_model', 'tools', 'post_call_analyses', 'stt_provider', 'stt_language', 'speak_first'];
+        const vals = [newId, name, body.display_name || name, body.description || '', body.llm_provider || 'anthropic', body.llm_model || 'us.anthropic.claude-sonnet-4-6', body.temperature ?? 0.7, body.max_tokens ?? 1024, body.system_prompt || '', body.first_message || '', body.tts_provider || 'elevenlabs', body.tts_voice_id || '', body.tts_model || 'eleven_turbo_v2_5', JSON.stringify(body.tools || []), JSON.stringify(body.post_call_analyses || { model: 'us.anthropic.claude-haiku-4-5-20251001', fields: [] }), body.stt_provider || 'elevenlabs', body.stt_language || 'en', body.speak_first === false ? false : true];
         const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
         await pool.query(`INSERT INTO voice_agents (${cols.join(', ')}) VALUES (${placeholders})`, vals);
         const r = await pool.query(`SELECT ${AGENT_COLS} FROM voice_agents WHERE id = $1`, [newId]);
@@ -910,7 +923,7 @@ export async function handler(event) {
         const updates = [];
         const vals = [];
         let idx = 1;
-        const allowed = ['display_name', 'description', 'llm_provider', 'llm_model', 'temperature', 'max_tokens', 'enable_prompt_caching', 'tts_provider', 'tts_voice_id', 'tts_model', 'tts_stability', 'tts_similarity_boost', 'tts_style', 'tts_use_speaker_boost', 'tts_speed', 'stt_provider', 'stt_language', 'stt_keywords', 'tools', 'system_prompt', 'first_message', 'ivr_goal', 'recording_enabled', 'recording_channels', 'post_call_analyses', 'idle_timeout_secs', 'idle_message', 'max_call_duration_secs', 'voicemail_action', 'voicemail_message', 'max_retries', 'retry_delay_secs', 'default_concurrency', 'calling_window_start', 'calling_window_end', 'calling_window_days', 'is_active'];
+        const allowed = ['display_name', 'description', 'llm_provider', 'llm_model', 'temperature', 'max_tokens', 'enable_prompt_caching', 'tts_provider', 'tts_voice_id', 'tts_model', 'tts_stability', 'tts_similarity_boost', 'tts_style', 'tts_use_speaker_boost', 'tts_speed', 'stt_provider', 'stt_language', 'stt_keywords', 'tools', 'system_prompt', 'first_message', 'ivr_goal', 'recording_enabled', 'recording_channels', 'post_call_analyses', 'idle_timeout_secs', 'idle_message', 'max_call_duration_secs', 'voicemail_action', 'voicemail_message', 'max_retries', 'retry_delay_secs', 'default_concurrency', 'calling_window_start', 'calling_window_end', 'calling_window_days', 'is_active', 'speak_first'];
         for (const col of allowed) {
           if (body[col] !== undefined) {
             updates.push(`${col} = $${idx}`);
@@ -944,9 +957,9 @@ export async function handler(event) {
         const agent = src.rows[0];
         const newId = uuid();
         await pool.query(
-          `INSERT INTO voice_agents (id, name, display_name, description, llm_provider, llm_model, temperature, max_tokens, system_prompt, first_message, tts_provider, tts_voice_id, tts_model, tools, post_call_analyses, stt_provider, stt_language)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
-          [newId, newName, body.display_name || newName, agent.description, agent.llm_provider, agent.llm_model, agent.temperature, agent.max_tokens, agent.system_prompt, agent.first_message, agent.tts_provider, agent.tts_voice_id, agent.tts_model, JSON.stringify(agent.tools), JSON.stringify(agent.post_call_analyses), agent.stt_provider, agent.stt_language]
+          `INSERT INTO voice_agents (id, name, display_name, description, llm_provider, llm_model, temperature, max_tokens, system_prompt, first_message, tts_provider, tts_voice_id, tts_model, tools, post_call_analyses, stt_provider, stt_language, speak_first)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+          [newId, newName, body.display_name || newName, agent.description, agent.llm_provider, agent.llm_model, agent.temperature, agent.max_tokens, agent.system_prompt, agent.first_message, agent.tts_provider, agent.tts_voice_id, agent.tts_model, JSON.stringify(agent.tools), JSON.stringify(agent.post_call_analyses), agent.stt_provider, agent.stt_language, agent.speak_first === false ? false : true]
         );
         const r = await pool.query(`SELECT ${AGENT_COLS} FROM voice_agents WHERE id = $1`, [newId]);
         return respond(201, r.rows[0]);
