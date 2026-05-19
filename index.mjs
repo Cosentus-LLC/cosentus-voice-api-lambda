@@ -11,21 +11,25 @@
  *   GET/PUT      /api/agents/:name/prompt — System prompt management
  *   GET          /api/agent-schema        — Agent config schema (models, voices, etc)
  *   GET/POST/PUT /api/agent-drafts/:id    — Draft management (replaces Supabase)
+ *   GET/PUT      /api/agents/:name/draft  — Nested alias of agent-drafts (frontend uses this path)
  *   GET/POST     /api/agent-versions/:id  — Version history (replaces Supabase)
+ *   GET/POST     /api/agents/:name/versions — Nested alias of agent-versions (frontend uses this path)
  *   GET          /api/calls               — Call history (paginated, filterable)
  *   GET          /api/calls/:id           — Call detail
+ *   DELETE       /api/calls/:id           — Soft-delete (alias of PUT :id/hide)
  *   GET          /api/calls/:id/recording-url — Signed recording URL
  *   GET          /api/calls/agents        — Distinct agent names from calls
  *   GET          /api/batches             — List batches
  *   GET          /api/batches/:id         — Batch detail + calls
- *   POST         /api/batches/upload      — Upload CSV
+ *   POST         /api/batches/upload      — Upload CSV or Excel (multipart/form-data)
  *   PUT          /api/batches/:id/rows    — Update mapped rows
  *   POST         /api/batches/:id/start   — Start batch
  *   POST         /api/batches/:id/pause   — Pause batch
  *   POST         /api/batches/:id/resume  — Resume batch
  *   POST         /api/batches/:id/cancel  — Cancel batch
  *   GET          /api/batches/:id/status  — Batch progress
- *   GET          /api/batches/:id/download-url — Results download
+ *   GET          /api/batches/:id/download-url — Results download (returns { url } with presigned URL)
+ *   GET          /api/batches/:id/results — Results download (302 redirect to presigned URL)
  *   DELETE       /api/batches/:id/draft   — Delete draft batch
  *   GET          /api/phone-numbers       — List phone numbers
  *   POST         /api/phone-numbers       — Add phone number
@@ -51,6 +55,9 @@ import pg from 'pg';
 import crypto from 'crypto';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import * as dailyPhoneClient from './lib/daily-phone-client.mjs';
+import { presignS3Url } from './lib/s3-presign.mjs';
+import { parseMultipart, parseSpreadsheet } from './lib/multipart-parser.mjs';
+import * as elevenlabs from './lib/elevenlabs-client.mjs';
 const { Pool } = pg;
 
 // ─── SQS (call request queue) ───────────────────────────────────────────────
@@ -71,6 +78,22 @@ const pool = new Pool({
 
 const uuid = () => crypto.randomUUID();
 const respond = (code, body) => ({ statusCode: code, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': '*' }, body: JSON.stringify(body) });
+
+// 302 redirect response. Used by GET /api/batches/:id/results to send
+// the browser straight to the presigned S3 URL instead of returning
+// a JSON wrapper (so a plain `<a href="/api/batches/:id/results"
+// download>` works).
+const redirect = (location) => ({
+  statusCode: 302,
+  headers: {
+    Location: location,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Allow-Methods': '*',
+  },
+  body: '',
+});
 
 // ─── Cold Start: Create voice_* tables ─────────────────────────────────────
 let tablesReady = false;
@@ -1003,6 +1026,104 @@ export async function handler(event) {
         const vars = [...content.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g)].map(m => m[1].trim());
         return respond(200, { prompt_variables: [...new Set(vars)], prompt_preview: content.substring(0, 500) });
       }
+
+      // ─── Nested aliases for frontend's RESTful path style ─────────
+      // The voiceagentfront app calls /api/agents/:name/draft and
+      // /api/agents/:name/versions instead of the older flat
+      // /api/agent-drafts/:id and /api/agent-versions/:id routes.
+      // Both shapes resolve to the same handlers — kept defensive so
+      // any other caller still using the flat paths keeps working.
+      // Frontend-v2 alignment audit B1/B2/B3/B4 (2026-05-19).
+
+      // GET /api/agents/:name/draft → forwards to agent-drafts GET logic
+      if (method === 'GET' && id && sub === 'draft') {
+        const r = await pool.query('SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]);
+        return respond(200, r.rows[0] || null);
+      }
+
+      // PUT /api/agents/:name/draft → forwards to agent-drafts PUT logic
+      if (method === 'PUT' && id && sub === 'draft') {
+        // Mirror the flat /api/agent-drafts/:id behavior exactly:
+        // load existing, validate merged state, then UPDATE/UPSERT.
+        const existing = await pool.query(
+          'SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]
+        );
+        const vErrors = validateDraftMerged(existing.rows[0], body);
+        if (vErrors.length) return respond(400, { error: 'Validation failed', details: vErrors });
+        body.updated_at = new Date().toISOString();
+        for (const k of Object.keys(body)) {
+          if (typeof body[k] === 'object' && body[k] !== null) body[k] = JSON.stringify(body[k]);
+        }
+        const cols = Object.keys(body).filter(k => /^[a-z_]+$/.test(k) && k !== 'id' && k !== 'agent_id');
+        if (!cols.length) {
+          const r = await pool.query('SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]);
+          return respond(200, r.rows[0] || null);
+        }
+        const vals = cols.map(k => body[k]);
+        vals.push(id);
+        const sets = cols.map((c, i) => `${c} = $${i + 1}`).join(', ');
+        // UPSERT-on-update behavior: if no row exists for this
+        // agent_id yet, INSERT one so the frontend's "init draft on
+        // first patch" pattern works.
+        const updated = await pool.query(
+          `UPDATE voice_agent_drafts SET ${sets} WHERE agent_id = $${vals.length} RETURNING *`,
+          vals,
+        );
+        if (updated.rows.length) {
+          return respond(200, updated.rows[0]);
+        }
+        // No existing draft — create one. INSERT with the patch
+        // values + agent_id; missing columns fall back to defaults.
+        const insertCols = ['agent_id', ...cols];
+        const insertVals = [id, ...cols.map(k => body[k])];
+        const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(', ');
+        await pool.query(
+          `INSERT INTO voice_agent_drafts (${insertCols.join(', ')}) VALUES (${placeholders})
+             ON CONFLICT (agent_id) DO UPDATE SET ${cols.map(c => `${c} = EXCLUDED.${c}`).join(', ')}`,
+          insertVals,
+        );
+        const after = await pool.query('SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]);
+        return respond(200, after.rows[0]);
+      }
+
+      // DELETE /api/agents/:name/draft → defensive alias used by
+      // frontend's batches/new unmount cleanup (and parity with
+      // GET/PUT alias). Existing flat path doesn't have a DELETE
+      // either; this is a small addition that closes the loop.
+      if (method === 'DELETE' && id && sub === 'draft') {
+        await pool.query('DELETE FROM voice_agent_drafts WHERE agent_id = $1', [id]);
+        return respond(200, { deleted: true });
+      }
+
+      // GET /api/agents/:name/versions → forwards to agent-versions
+      // GET logic, returning the array directly so the frontend's
+      // {versions} unwrap or bare-array handling both work.
+      if (method === 'GET' && id && sub === 'versions') {
+        const r = await pool.query(
+          'SELECT * FROM voice_agent_versions WHERE agent_id = $1 ORDER BY version_number DESC',
+          [id],
+        );
+        // Frontend's `listAgentVersions` accepts `{versions: [...]}`
+        // OR a bare array. Standardize on the wrapped form here so
+        // future callers don't have to handle two shapes.
+        return respond(200, { versions: r.rows });
+      }
+
+      // POST /api/agents/:name/versions → forwards to agent-versions
+      // POST logic. Coerces agent_id from URL param so the body
+      // doesn't need to repeat it; the frontend currently sends it
+      // anyway, but either shape works.
+      if (method === 'POST' && id && sub === 'versions') {
+        const newId = uuid();
+        const agentId = body.agent_id || id;
+        const { version_number, version_name, description, config_snapshot, phone_assignments, published_by } = body;
+        await pool.query(
+          `INSERT INTO voice_agent_versions (id, agent_id, version_number, version_name, description, config_snapshot, phone_assignments, published_at, published_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8)`,
+          [newId, agentId, version_number, version_name || '', description || '', JSON.stringify(config_snapshot || {}), JSON.stringify(phone_assignments || []), published_by || null]
+        );
+        return respond(201, { id: newId, agent_id: agentId, version_number, version_name: version_name || '', description: description || '' });
+      }
     }
 
     // ═══ Agent Drafts (replaces Supabase) ═══
@@ -1124,11 +1245,19 @@ export async function handler(event) {
         return respond(200, { agents: r.rows.map(row => ({ agent_name: row.agent_name, display_name: row.agent_display_name || row.agent_name })) });
       }
       // GET /api/calls/:id/recording-url
+      //
+      // Frontend-v2 alignment audit B10 (2026-05-19):
+      // recording_path is stored as either an "s3://bucket/key" URI
+      // or a bare S3 key. The frontend's <audio> player can't load
+      // either of those; it needs a real HTTPS URL. presignS3Url
+      // turns the stored value into a 15-minute presigned URL on
+      // every call. Pre-existing HTTPS values pass through
+      // unchanged for backwards compatibility with any legacy rows.
       if (id && sub === 'recording-url' && method === 'GET') {
         const r = await pool.query('SELECT recording_path FROM voice_calls WHERE id = $1', [id]);
         if (!r.rows.length || !r.rows[0].recording_path) return respond(200, { url: null });
-        // TODO: Generate S3 presigned URL for the recording
-        return respond(200, { url: r.rows[0].recording_path });
+        const url = await presignS3Url(r.rows[0].recording_path);
+        return respond(200, { url: url || null });
       }
       // POST /api/calls — upsert call record (used by calling engine)
       //
@@ -1238,6 +1367,17 @@ export async function handler(event) {
         if (!r.rows.length) return respond(404, { detail: 'Call not found' });
         return respond(200, { status: 'hidden', id: r.rows[0].id });
       }
+
+      // DELETE /api/calls/:id — convention-friendly alias for the
+      // PUT :id/hide soft-delete. The frontend uses DELETE which
+      // matches REST norms; the old PUT shape is preserved for any
+      // legacy callers. Both produce the same DB state.
+      // Frontend-v2 alignment audit B5 (2026-05-19).
+      if (method === 'DELETE' && id && !sub) {
+        const r = await pool.query('UPDATE voice_calls SET hidden = true WHERE id = $1 RETURNING id', [id]);
+        if (!r.rows.length) return respond(404, { detail: 'Call not found' });
+        return respond(200, { status: 'hidden', id: r.rows[0].id, deleted: true });
+      }
       // POST /api/calls/recording-update
       //
       // Phase 7E PR 3: Daily's recording.ready-to-download webhook
@@ -1280,6 +1420,18 @@ export async function handler(event) {
         return respond(200, r.rows[0]);
       }
       // GET /api/calls — paginated list
+      //
+      // Filter params:
+      //   agent_name           — match voice_calls.agent_name exactly (slug)
+      //   agent_display_name   — match voice_calls.agent_display_name exactly.
+      //                          Frontend-v2 alignment audit B9
+      //                          (2026-05-19): voiceagentfront sends
+      //                          this query key from its agent filter
+      //                          dropdown; the previous handler only
+      //                          accepted agent_name and silently
+      //                          dropped the filter. Now both work.
+      //   status / direction   — exact-match filters
+      //   sort_by / sort_order — allowlist-enforced sort
       if (method === 'GET' && !id) {
         const page = parseInt(qs.page) || 1;
         const pageSize = Math.min(parseInt(qs.page_size) || 25, 100);
@@ -1288,6 +1440,7 @@ export async function handler(event) {
         const params = [];
         let idx = 1;
         if (qs.agent_name) { where += ` AND agent_name = $${idx++}`; params.push(qs.agent_name); }
+        if (qs.agent_display_name) { where += ` AND agent_display_name = $${idx++}`; params.push(qs.agent_display_name); }
         if (qs.status) { where += ` AND status = $${idx++}`; params.push(qs.status); }
         if (qs.direction) { where += ` AND direction = $${idx++}`; params.push(qs.direction); }
         const sortBy = ['created_at', 'duration_secs', 'status'].includes(qs.sort_by) ? qs.sort_by : 'created_at';
@@ -1337,18 +1490,163 @@ export async function handler(event) {
         const r = await pool.query('SELECT * FROM voice_batches WHERE id = $1', [batchId]);
         return respond(201, r.rows[0] || { id: batchId });
       }
-      // POST /api/batches/upload (legacy — accepts JSON with rows directly)
+      // POST /api/batches/upload
+      //
+      // Frontend-v2 alignment audit B7 (2026-05-19): the frontend
+      // dropzone sends a multipart/form-data POST with `file`,
+      // `agent_name`, and `from_number` fields. Previously this
+      // handler expected `application/json` and silently created
+      // an empty draft from {}. Now:
+      //   - multipart/form-data → parse the file (CSV or .xlsx),
+      //     build a normalized row list, persist a draft batch
+      //   - application/json (legacy)  → accept {rows: [...]} as
+      //     before so existing scripts keep working
+      //
+      // Either content type produces the same response shape so
+      // the frontend's UploadResponse handling is unchanged:
+      //   { batch_id, columns, summary, rows }
+      //
+      // The handler validates phone numbers using normalizeE164 to
+      // produce `phone_e164` + a `validation` flag on each row.
+      // The frontend's editable grid surfaces these as
+      // valid/fixable/invalid.
       if (method === 'POST' && id === 'upload') {
-        // TODO: Parse multipart form data (CSV file)
-        // For now, accept JSON with rows
+        const contentType =
+          (event.headers?.['content-type']) ||
+          (event.headers?.['Content-Type']) ||
+          '';
+        const isMultipart = contentType.toLowerCase().startsWith('multipart/form-data');
+
+        let agent_name;
+        let from_number;
+        let batchName;
+        let columns = [];
+        let rows = [];
+
+        if (isMultipart) {
+          let parsed;
+          try {
+            parsed = await parseMultipart(event);
+          } catch (e) {
+            return respond(400, { detail: `multipart parse failed: ${e.message}` });
+          }
+          agent_name = parsed.fields.agent_name || parsed.fields.agentName;
+          from_number = parsed.fields.from_number || parsed.fields.fromNumber || '';
+          batchName = parsed.fields.name || parsed.fields.batch_name;
+          const file = parsed.files[0];
+          if (!file) {
+            return respond(400, { detail: 'file field is required' });
+          }
+          try {
+            const sheet = await parseSpreadsheet(file);
+            columns = sheet.columns;
+            rows = sheet.rows;
+          } catch (e) {
+            return respond(400, { detail: `file parse failed: ${e.message}` });
+          }
+        } else {
+          agent_name = body.agent_name;
+          from_number = body.from_number || '';
+          batchName = body.name;
+          rows = Array.isArray(body.rows) ? body.rows : [];
+          columns = Object.keys(rows[0] || {});
+        }
+
+        if (!agent_name) return respond(400, { detail: 'agent_name is required' });
+
+        // Validate + classify rows. The frontend's UploadResponse
+        // expects per-row { row_index, phone, phone_e164, validation }
+        // plus original case_data fields so the editable grid can
+        // show the parsed cells.
+        //
+        // Classification rules:
+        //   valid    — raw input already starts with `+` and is a
+        //              well-formed E.164 number
+        //   fixable  — raw input is 10 digits (or 11 starting with
+        //              1) without a `+`; we add +1 (or +) and the
+        //              result is valid E.164. UI should let the
+        //              user confirm/edit before sending.
+        //   invalid  — empty, garbled, or no fix yields a valid
+        //              E.164 number.
+        const PHONE_COLUMNS = ['phone', 'phone_number', 'phoneNumber', 'Phone', 'Phone Number', 'tel'];
+        const normalizedRows = rows.map((raw, i) => {
+          const rawPhone = (
+            raw.phone_e164 ||
+            raw.phone ||
+            PHONE_COLUMNS.map(c => raw[c]).find(v => v) ||
+            ''
+          ).toString().trim();
+
+          let validation = 'invalid';
+          let phoneE164 = rawPhone;
+
+          if (!rawPhone) {
+            validation = 'invalid';
+            phoneE164 = '';
+          } else if (rawPhone.startsWith('+')) {
+            const normalized = normalizeE164(rawPhone);
+            if (normalized) {
+              validation = 'valid';
+              phoneE164 = normalized;
+            } else {
+              validation = 'invalid';
+            }
+          } else {
+            // No `+` prefix. Try to coerce to US E.164 by stripping
+            // non-digits and prepending +1 (or +) so the user can
+            // confirm. Mark as fixable so the editable grid surfaces
+            // the row for review.
+            const digits = rawPhone.replace(/\D/g, '');
+            let candidate = null;
+            if (digits.length === 10) candidate = `+1${digits}`;
+            else if (digits.length === 11 && digits.startsWith('1')) candidate = `+${digits}`;
+            else if (digits.length >= 7 && digits.length <= 15) candidate = `+${digits}`;
+            const normalized = candidate ? normalizeE164(candidate) : null;
+            if (normalized) {
+              validation = 'fixable';
+              phoneE164 = normalized;
+            } else {
+              validation = 'invalid';
+            }
+          }
+
+          return {
+            row_index: i,
+            phone: rawPhone,
+            phone_e164: phoneE164,
+            validation,
+            data: raw,
+          };
+        });
+
+        const summary = {
+          total: normalizedRows.length,
+          valid: normalizedRows.filter(r => r.validation === 'valid').length,
+          fixable: normalizedRows.filter(r => r.validation === 'fixable').length,
+          invalid: normalizedRows.filter(r => r.validation === 'invalid').length,
+        };
+
         const batchId = uuid();
-        const rows = body.rows || [];
+        const today = new Date().toISOString().slice(0, 10);
         await pool.query(
           `INSERT INTO voice_batches (id, name, agent_name, from_number, status, total_rows, rows)
            VALUES ($1, $2, $3, $4, 'draft', $5, $6)`,
-          [batchId, body.name || `Batch ${new Date().toISOString().slice(0, 10)}`, body.agent_name, body.from_number, rows.length, JSON.stringify(rows)]
+          [
+            batchId,
+            batchName || `Batch ${today}`,
+            agent_name,
+            from_number,
+            normalizedRows.length,
+            JSON.stringify(normalizedRows),
+          ],
         );
-        return respond(201, { batch_id: batchId, columns: Object.keys(rows[0] || {}), summary: { total: rows.length, valid: rows.length, fixable: 0, invalid: 0 }, rows });
+
+        return respond(201, {
+          batch_id: batchId,
+          columns: columns.length ? columns : Object.keys(rows[0] || {}),
+          summary,
+          rows: normalizedRows,
+        });
       }
       // PUT /api/batches/:id — update batch fields (status, counters, etc.)
       if (method === 'PUT' && id && !sub) {
@@ -1450,9 +1748,41 @@ export async function handler(event) {
         return respond(200, { batch_id: id, ...r.rows[0] });
       }
       // GET /api/batches/:id/download-url
+      //
+      // Frontend-v2 alignment audit B6 (2026-05-19): turns the
+      // stored output_file_path (typically "s3://bucket/key.xlsx")
+      // into a 15-minute presigned URL before returning. Frontend's
+      // existing `window.open(url)` flow now actually downloads the
+      // file. Returns { url: null } when no results exist yet.
       if (method === 'GET' && id && sub === 'download-url') {
         const r = await pool.query('SELECT output_file_path FROM voice_batches WHERE id = $1', [id]);
-        return respond(200, { url: r.rows[0]?.output_file_path || null });
+        const rawPath = r.rows[0]?.output_file_path;
+        if (!rawPath) return respond(200, { url: null });
+        const url = await presignS3Url(rawPath);
+        return respond(200, { url: url || null });
+      }
+
+      // GET /api/batches/:id/results
+      //
+      // Frontend-v2 alignment audit B6 (2026-05-19): companion route
+      // to /download-url. Returns a 302 redirect to the presigned
+      // URL so a plain `<a href=".../results" download>` link works
+      // without JS — the frontend uses fetch + blob-download today
+      // but the redirect shape is the more browser-native pattern
+      // and is what the audit recommended.
+      // Returns 404 when no output is available yet.
+      if (method === 'GET' && id && sub === 'results') {
+        const r = await pool.query('SELECT output_file_path, status FROM voice_batches WHERE id = $1', [id]);
+        if (!r.rows.length) return respond(404, { detail: 'Batch not found' });
+        const rawPath = r.rows[0].output_file_path;
+        if (!rawPath) {
+          return respond(404, { detail: 'Batch results not yet available', status: r.rows[0].status });
+        }
+        const url = await presignS3Url(rawPath);
+        if (!url) {
+          return respond(500, { detail: 'Failed to generate download URL' });
+        }
+        return redirect(url);
       }
       // DELETE /api/batches/:id/draft
       if (method === 'DELETE' && id && sub === 'draft') {
@@ -1693,9 +2023,62 @@ export async function handler(event) {
         return respond(200, { voices: r.rows });
       }
       // POST /api/voices/sync
+      //
+      // Frontend-v2 alignment audit B11 (2026-05-19): bulk-refresh
+      // the library from ElevenLabs. Walks ElevenLabs's /v1/voices
+      // response and upserts each entry into voice_voices using the
+      // same column set as /voices/add. The `custom_name` and
+      // `labels` columns on existing rows are preserved (the upsert
+      // only overwrites name / description / preview_url / gender /
+      // accent / age / category).
+      //
+      // Degrades to a stub-style response when ELEVENLABS_API_KEY
+      // is unset so the frontend's "Sync" button doesn't error
+      // pre-launch.
       if (method === 'POST' && id === 'sync') {
-        // TODO: Call ElevenLabs API to sync voices
-        return respond(200, { count: 0, message: 'ElevenLabs sync not yet configured' });
+        if (!elevenlabs.isConfigured()) {
+          return respond(200, {
+            count: 0,
+            message: 'ElevenLabs sync not yet configured (ELEVENLABS_API_KEY missing)',
+          });
+        }
+        const r = await elevenlabs.listVoices();
+        if (!r.ok) {
+          return respond(502, {
+            detail: `ElevenLabs API error: ${r.error}`,
+          });
+        }
+        let count = 0;
+        for (const elVoice of r.voices) {
+          const row = elevenlabs.elToVoiceRow(elVoice);
+          if (!row || !row.voice_id) continue;
+          await pool.query(
+            `INSERT INTO voice_voices (voice_id, name, description, preview_url, gender, accent, age, category, labels)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (voice_id) DO UPDATE SET
+               name = COALESCE(EXCLUDED.name, voice_voices.name),
+               description = COALESCE(EXCLUDED.description, voice_voices.description),
+               preview_url = COALESCE(EXCLUDED.preview_url, voice_voices.preview_url),
+               gender = COALESCE(EXCLUDED.gender, voice_voices.gender),
+               accent = COALESCE(EXCLUDED.accent, voice_voices.accent),
+               age = COALESCE(EXCLUDED.age, voice_voices.age),
+               category = COALESCE(EXCLUDED.category, voice_voices.category),
+               labels = COALESCE(EXCLUDED.labels, voice_voices.labels)`,
+            [
+              row.voice_id,
+              row.name,
+              row.description,
+              row.preview_url,
+              row.gender,
+              row.accent,
+              row.age,
+              row.category,
+              row.labels ? JSON.stringify(row.labels) : null,
+            ],
+          );
+          count++;
+        }
+        return respond(200, { count, message: `Synced ${count} voices from ElevenLabs` });
       }
       // POST /api/voices/lookup
       if (method === 'POST' && id === 'lookup') {
@@ -1736,10 +2119,60 @@ export async function handler(event) {
         const r = await pool.query('SELECT * FROM voice_voices WHERE voice_id = $1', [body.voice_id]);
         return respond(200, r.rows[0]);
       }
-      // POST /api/voices/:id/refresh — EC2 proxy fetches from ElevenLabs and POSTs to /voices/add
+      // POST /api/voices/:id/refresh
+      //
+      // Frontend-v2 alignment audit B11 (2026-05-19): hit ElevenLabs
+      // for the single voice's latest metadata and upsert into
+      // voice_voices. When ELEVENLABS_API_KEY is unset, falls back
+      // to the previous behavior of returning the cached DB row
+      // (no error) so the frontend's "Refresh" menu item still
+      // works pre-launch.
       if (method === 'POST' && id && sub === 'refresh') {
-        const r = await pool.query('SELECT * FROM voice_voices WHERE voice_id = $1', [id]);
-        return respond(200, r.rows[0] || {});
+        if (!elevenlabs.isConfigured()) {
+          const r = await pool.query('SELECT * FROM voice_voices WHERE voice_id = $1', [id]);
+          return respond(200, r.rows[0] || {});
+        }
+        const r = await elevenlabs.getVoice(id);
+        if (!r.ok) {
+          // 404 / 401 / network errors all roll up here. Return the
+          // cached row + a non-fatal message so the UI can show a
+          // toast without blocking other refresh attempts.
+          const cached = await pool.query('SELECT * FROM voice_voices WHERE voice_id = $1', [id]);
+          return respond(r.status === 404 ? 404 : 200, {
+            voice: cached.rows[0] || null,
+            warning: `ElevenLabs refresh failed: ${r.error}`,
+          });
+        }
+        const row = elevenlabs.elToVoiceRow(r.voice);
+        if (!row?.voice_id) {
+          return respond(502, { detail: 'ElevenLabs returned an unrecognized voice payload' });
+        }
+        await pool.query(
+          `INSERT INTO voice_voices (voice_id, name, description, preview_url, gender, accent, age, category, labels)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (voice_id) DO UPDATE SET
+             name = COALESCE(EXCLUDED.name, voice_voices.name),
+             description = COALESCE(EXCLUDED.description, voice_voices.description),
+             preview_url = COALESCE(EXCLUDED.preview_url, voice_voices.preview_url),
+             gender = COALESCE(EXCLUDED.gender, voice_voices.gender),
+             accent = COALESCE(EXCLUDED.accent, voice_voices.accent),
+             age = COALESCE(EXCLUDED.age, voice_voices.age),
+             category = COALESCE(EXCLUDED.category, voice_voices.category),
+             labels = COALESCE(EXCLUDED.labels, voice_voices.labels)`,
+          [
+            row.voice_id,
+            row.name,
+            row.description,
+            row.preview_url,
+            row.gender,
+            row.accent,
+            row.age,
+            row.category,
+            row.labels ? JSON.stringify(row.labels) : null,
+          ],
+        );
+        const after = await pool.query('SELECT * FROM voice_voices WHERE voice_id = $1', [id]);
+        return respond(200, after.rows[0]);
       }
       // DELETE /api/voices/:id
       if (method === 'DELETE' && id && !sub) {
