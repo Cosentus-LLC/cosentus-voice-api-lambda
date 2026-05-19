@@ -1073,13 +1073,28 @@ export async function handler(event) {
           return respond(200, updated.rows[0]);
         }
         // No existing draft — create one. INSERT with the patch
-        // values + agent_id; missing columns fall back to defaults.
-        const insertCols = ['agent_id', ...cols];
-        const insertVals = [id, ...cols.map(k => body[k])];
+        // values + agent_id. voice_agent_drafts has NOT NULL on
+        // `name` (the agent slug column), so default to the URL
+        // param when the patch doesn't include it. All other
+        // columns have table-level defaults.
+        const insertCols = ['agent_id'];
+        const insertVals = [id];
+        if (!cols.includes('name')) {
+          insertCols.push('name');
+          insertVals.push(id);
+        }
+        for (const col of cols) {
+          insertCols.push(col);
+          insertVals.push(body[col]);
+        }
         const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(', ');
+        const upsertSets = insertCols
+          .filter(c => c !== 'agent_id' && c !== 'id')
+          .map(c => `${c} = EXCLUDED.${c}`)
+          .join(', ');
         await pool.query(
           `INSERT INTO voice_agent_drafts (${insertCols.join(', ')}) VALUES (${placeholders})
-             ON CONFLICT (agent_id) DO UPDATE SET ${cols.map(c => `${c} = EXCLUDED.${c}`).join(', ')}`,
+             ON CONFLICT (agent_id) DO UPDATE SET ${upsertSets}`,
           insertVals,
         );
         const after = await pool.query('SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]);
