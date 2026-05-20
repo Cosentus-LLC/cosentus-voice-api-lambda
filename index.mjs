@@ -427,8 +427,21 @@ async function ensureTables() {
 // ─── Helpers ───────────────────────────────────────────────────────────────
 function parseRoute(event) {
   let path = event.rawPath || event.path || '/';
-  // Strip API Gateway stage + route prefix (e.g. /prod/voice/api/health → /api/health)
-  path = path.replace(/^\/prod\/voice/, '').replace(/^\/voice/, '') || '/';
+  // Strip API Gateway stage + route prefix. Three prefixes are
+  // recognized, in priority order:
+  //   /prod/voice/...  — production API Gateway route (existing)
+  //   /dev/voice/...   — dev API Gateway route (added 2026-05-20 so the
+  //                      frontend voiceagentfront can verify P1 against
+  //                      medcloud-voice-api-dev via a browser-reachable
+  //                      URL on the medcloud-api HTTP API)
+  //   /voice/...       — legacy / no-stage form
+  // The order matters: try the most specific prefix first so a path
+  // like "/voice/api/..." doesn't incorrectly match "/voice" before
+  // we've checked for "/prod/voice" or "/dev/voice".
+  path = path
+    .replace(/^\/prod\/voice/, '')
+    .replace(/^\/dev\/voice/, '')
+    .replace(/^\/voice/, '') || '/';
   const method = event.requestContext?.http?.method || event.httpMethod || 'GET';
   const qs = event.queryStringParameters || {};
   let body = {};

@@ -631,6 +631,70 @@ describe('B11: ElevenLabs sync + refresh', () => {
   });
 });
 
+// --- Dev API Gateway route prefix stripping ---------------------------
+
+describe('parseRoute: /dev/voice prefix stripping', () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it('strips /dev/voice/ prefix the same way /prod/voice/ is stripped', async () => {
+    stubPool(() => ({ rows: [] }));
+    const res = await handler({
+      httpMethod: 'GET',
+      path: '/dev/voice/api/health',
+      // Newer HTTP API v2 events use rawPath; older REST API events use path.
+      // The dev-route case uses HTTP API v2, so include both for parity.
+      rawPath: '/dev/voice/api/health',
+    });
+    expect(res.statusCode).toBe(200);
+    const body = parseBody(res);
+    expect(body.status).toBe('healthy');
+  });
+
+  it('strips /dev/voice on a nested CRUD path (e.g. agent draft)', async () => {
+    let queriedSql = null;
+    stubPool((sql) => {
+      queriedSql = sql;
+      return { rows: [{ agent_id: 'chris', display_name: 'Test' }] };
+    });
+    const res = await handler({
+      httpMethod: 'GET',
+      rawPath: '/dev/voice/api/agents/chris/draft',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(queriedSql).toContain('voice_agent_drafts');
+  });
+
+  it('legacy /prod/voice route still works (no regression)', async () => {
+    stubPool(() => ({ rows: [] }));
+    const res = await handler({
+      httpMethod: 'GET',
+      rawPath: '/prod/voice/api/health',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(parseBody(res).status).toBe('healthy');
+  });
+
+  it('legacy /voice route still works (no regression)', async () => {
+    stubPool(() => ({ rows: [] }));
+    const res = await handler({
+      httpMethod: 'GET',
+      rawPath: '/voice/api/health',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(parseBody(res).status).toBe('healthy');
+  });
+
+  it('un-prefixed /api/ paths still work (existing behavior)', async () => {
+    stubPool(() => ({ rows: [] }));
+    const res = await handler({
+      httpMethod: 'GET',
+      rawPath: '/api/health',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(parseBody(res).status).toBe('healthy');
+  });
+});
+
 // --- B8: /api/calls/agents response shape -----------------------------
 
 describe('B8: GET /api/calls/agents (verify shape)', () => {
