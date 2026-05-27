@@ -957,7 +957,18 @@ export async function handler(event) {
         // on the table would already produce these values for an INSERT
         // that omits the columns, but this handler builds the column
         // list explicitly so the fallbacks have to live here too.
-        const vals = [newId, name, body.display_name || name, body.description || '', body.llm_provider || 'anthropic', body.llm_model || 'us.anthropic.claude-haiku-4-5-20251001', body.temperature ?? 0.7, body.max_tokens ?? 1024, body.system_prompt || '', body.first_message || '', body.tts_provider || 'elevenlabs', body.tts_voice_id || '', body.tts_model || 'eleven_turbo_v2_5', JSON.stringify(body.tools || []), JSON.stringify(body.post_call_analyses || { model: 'us.anthropic.claude-haiku-4-5-20251001', fields: [] }), body.stt_provider || 'elevenlabs', body.stt_language || 'en', body.speak_first === false ? false : true];
+        //
+        // Notes on individual fallbacks:
+        // - temperature defaults to FIELD_RANGES.temperature.default
+        //   (0.2) — the table column DEFAULT is 0.7, but FIELD_RANGES
+        //   is the public-facing default the dashboard's "create new"
+        //   flow uses, so we match it here.
+        // - max_tokens defaults to FIELD_RANGES.max_tokens.default
+        //   (390) — the table check constraint caps max_tokens at
+        //   1000, and the old fallback was 1024 which violated the
+        //   constraint on any body that omitted max_tokens. Caught
+        //   2026-05-27 during disposable-agent smoke testing.
+        const vals = [newId, name, body.display_name || name, body.description || '', body.llm_provider || 'anthropic', body.llm_model || 'us.anthropic.claude-haiku-4-5-20251001', body.temperature ?? FIELD_RANGES.temperature.default, body.max_tokens ?? FIELD_RANGES.max_tokens.default, body.system_prompt || '', body.first_message || '', body.tts_provider || 'elevenlabs', body.tts_voice_id || '', body.tts_model || 'eleven_turbo_v2_5', JSON.stringify(body.tools || []), JSON.stringify(body.post_call_analyses || { model: 'us.anthropic.claude-haiku-4-5-20251001', fields: [] }), body.stt_provider || 'elevenlabs', body.stt_language || 'en', body.speak_first === false ? false : true];
         const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
         await pool.query(`INSERT INTO voice_agents (${cols.join(', ')}) VALUES (${placeholders})`, vals);
         const r = await pool.query(`SELECT ${AGENT_COLS} FROM voice_agents WHERE id = $1`, [newId]);
