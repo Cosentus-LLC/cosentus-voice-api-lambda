@@ -107,7 +107,15 @@ async function ensureTables() {
       display_name VARCHAR(200) NOT NULL DEFAULT '',
       description TEXT DEFAULT '',
       llm_provider VARCHAR(50) DEFAULT 'anthropic',
-      llm_model VARCHAR(100) DEFAULT 'us.anthropic.claude-sonnet-4-6',
+      -- Default Claude Haiku 4.5 for new agents.
+      -- Rationale: voice agent workloads (short turns, bounded reasoning,
+      -- tool-call-driven flows) fit Haiku's strengths. Sonnet 4.6 is ~3x
+      -- more expensive per token; we standardize on the cheap-good-enough
+      -- default and let power users explicitly opt into Sonnet for hard
+      -- cases. Existing agents (chris-claim-status etc) already have
+      -- their model column populated explicitly and are unaffected by
+      -- this DEFAULT change.
+      llm_model VARCHAR(100) DEFAULT 'us.anthropic.claude-haiku-4-5-20251001',
       temperature NUMERIC(3,2) DEFAULT 0.7,
       max_tokens INTEGER DEFAULT 1024,
       enable_prompt_caching BOOLEAN DEFAULT false,
@@ -324,7 +332,10 @@ async function ensureTables() {
       required_fields JSONB DEFAULT '[]',
       success_criteria JSONB DEFAULT '[]',
       post_call_analyses JSONB DEFAULT '{"model":"us.anthropic.claude-haiku-4-5-20251001","fields":[]}',
-      llm_model VARCHAR(100) DEFAULT 'us.anthropic.claude-sonnet-4-6',
+      -- Default Claude Haiku 4.5 for new call-flow templates (same
+      -- rationale as voice_agents.llm_model DEFAULT — cheap-good-enough
+      -- default; opt into Sonnet explicitly).
+      llm_model VARCHAR(100) DEFAULT 'us.anthropic.claude-haiku-4-5-20251001',
       is_default BOOLEAN DEFAULT false,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -826,7 +837,9 @@ const AGENT_SCHEMA = {
     temperature: 0.2,
     max_tokens: 390,
     llm_provider: 'anthropic',
-    llm_model: 'claude-sonnet-4-6',
+    // Claude Haiku 4.5 is the default for new agents — see the
+    // voice_agents CREATE TABLE comment for the rationale.
+    llm_model: 'claude-haiku-4-5',
     enable_prompt_caching: true,
 
     // TTS
@@ -862,7 +875,11 @@ const AGENT_SCHEMA = {
 
     // Tools / post-call
     tools: [],
-    post_call_analyses: { model: 'claude-sonnet-4-6', fields: [] },
+    // PCA defaults to Haiku 4.5 — same rationale as llm_model above.
+    // Post-call structured extraction is bounded reasoning over a
+    // transcript that already contains the answers; Haiku is more
+    // than sufficient and ~3x cheaper than Sonnet per invocation.
+    post_call_analyses: { model: 'claude-haiku-4-5', fields: [] },
 
     // Recording — system-level, always on. Exposed so the frontend mapper has
     // fallback values; not user-configurable.
@@ -935,7 +952,12 @@ export async function handler(event) {
         if (existing.rows.length) return respond(409, { detail: `Agent "${name}" already exists` });
         const newId = uuid();
         const cols = ['id', 'name', 'display_name', 'description', 'llm_provider', 'llm_model', 'temperature', 'max_tokens', 'system_prompt', 'first_message', 'tts_provider', 'tts_voice_id', 'tts_model', 'tools', 'post_call_analyses', 'stt_provider', 'stt_language', 'speak_first'];
-        const vals = [newId, name, body.display_name || name, body.description || '', body.llm_provider || 'anthropic', body.llm_model || 'us.anthropic.claude-sonnet-4-6', body.temperature ?? 0.7, body.max_tokens ?? 1024, body.system_prompt || '', body.first_message || '', body.tts_provider || 'elevenlabs', body.tts_voice_id || '', body.tts_model || 'eleven_turbo_v2_5', JSON.stringify(body.tools || []), JSON.stringify(body.post_call_analyses || { model: 'us.anthropic.claude-haiku-4-5-20251001', fields: [] }), body.stt_provider || 'elevenlabs', body.stt_language || 'en', body.speak_first === false ? false : true];
+        // Defaults match voice_agents CREATE TABLE — Haiku 4.5 for both
+        // llm_model and post_call_analyses.model. The DEFAULT clauses
+        // on the table would already produce these values for an INSERT
+        // that omits the columns, but this handler builds the column
+        // list explicitly so the fallbacks have to live here too.
+        const vals = [newId, name, body.display_name || name, body.description || '', body.llm_provider || 'anthropic', body.llm_model || 'us.anthropic.claude-haiku-4-5-20251001', body.temperature ?? 0.7, body.max_tokens ?? 1024, body.system_prompt || '', body.first_message || '', body.tts_provider || 'elevenlabs', body.tts_voice_id || '', body.tts_model || 'eleven_turbo_v2_5', JSON.stringify(body.tools || []), JSON.stringify(body.post_call_analyses || { model: 'us.anthropic.claude-haiku-4-5-20251001', fields: [] }), body.stt_provider || 'elevenlabs', body.stt_language || 'en', body.speak_first === false ? false : true];
         const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
         await pool.query(`INSERT INTO voice_agents (${cols.join(', ')}) VALUES (${placeholders})`, vals);
         const r = await pool.query(`SELECT ${AGENT_COLS} FROM voice_agents WHERE id = $1`, [newId]);
@@ -2310,7 +2332,10 @@ export async function handler(event) {
           const res = await pool.query(
             `INSERT INTO voice_call_templates (name, display_name, use_case, description, system_prompt, first_message, required_fields, success_criteria, post_call_analyses, llm_model)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (name) DO NOTHING`,
-            [t.name, t.display_name, t.use_case, t.description, t.system_prompt, t.first_message, JSON.stringify(t.required_fields||[]), JSON.stringify(t.success_criteria||[]), JSON.stringify(t.post_call_analyses||{}), t.llm_model||'us.anthropic.claude-sonnet-4-6']
+            // Template llm_model fallback matches voice_call_templates
+            // CREATE TABLE — Haiku 4.5 by default. Individual templates
+            // can override via t.llm_model if they need Sonnet.
+            [t.name, t.display_name, t.use_case, t.description, t.system_prompt, t.first_message, JSON.stringify(t.required_fields||[]), JSON.stringify(t.success_criteria||[]), JSON.stringify(t.post_call_analyses||{}), t.llm_model||'us.anthropic.claude-haiku-4-5-20251001']
           );
           if (res.rowCount) seeded++;
         }

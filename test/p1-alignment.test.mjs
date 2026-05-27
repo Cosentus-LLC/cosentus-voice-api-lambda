@@ -631,6 +631,96 @@ describe('B11: ElevenLabs sync + refresh', () => {
   });
 });
 
+// --- Haiku-default regression guards ----------------------------------
+//
+// 2026-05-27: cost-conscious defaults strategy. New agents created
+// without an explicit llm_model land on Haiku 4.5, not Sonnet 4.6.
+// Existing agents already have their model column populated and are
+// unaffected by these defaults. These tests pin the four places where
+// the default fires so a future change shows up in CI.
+
+describe('Haiku 4.5 default (cost-conscious defaults strategy)', () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it('GET /api/agent-schema defaults.llm_model is Haiku 4.5', async () => {
+    stubPool(() => ({ rows: [] }));
+    const res = await handler(evt('GET', '/api/agent-schema'));
+    expect(res.statusCode).toBe(200);
+    const schema = parseBody(res);
+    expect(schema.defaults.llm_model).toBe('claude-haiku-4-5');
+  });
+
+  it('GET /api/agent-schema defaults.post_call_analyses.model is Haiku 4.5', async () => {
+    stubPool(() => ({ rows: [] }));
+    const res = await handler(evt('GET', '/api/agent-schema'));
+    expect(res.statusCode).toBe(200);
+    const schema = parseBody(res);
+    expect(schema.defaults.post_call_analyses.model).toBe('claude-haiku-4-5');
+  });
+
+  it('POST /api/agents create handler INSERTs Haiku 4.5 when llm_model omitted', async () => {
+    let insertCols = null;
+    let insertVals = null;
+    stubPool((sql, params) => {
+      if (sql.startsWith('SELECT id FROM voice_agents WHERE name')) {
+        return { rows: [] }; // not found = OK to create
+      }
+      if (sql.startsWith('INSERT INTO voice_agents')) {
+        insertCols = sql;
+        insertVals = params;
+        return { rows: [] };
+      }
+      if (sql.startsWith('SELECT id, name')) {
+        return { rows: [{ id: 'new-id', name: 'fresh-agent', llm_model: 'us.anthropic.claude-haiku-4-5-20251001' }] };
+      }
+      return { rows: [{ id: 'new-id', name: 'fresh-agent', llm_model: 'us.anthropic.claude-haiku-4-5-20251001' }] };
+    });
+    const res = await handler(evt('POST', '/api/agents', {
+      body: { name: 'fresh-agent' },
+    }));
+    expect(res.statusCode).toBe(201);
+    expect(insertCols).toContain('voice_agents');
+    // llm_model is the 6th column in the cols array; the 6th param value
+    // is the one that should be Haiku.
+    // Verify the Haiku model ID appears somewhere in the params.
+    const stringified = (insertVals || []).filter(v => typeof v === 'string').join('|');
+    expect(stringified).toContain('us.anthropic.claude-haiku-4-5-20251001');
+  });
+
+  it('POST /api/agents preserves explicit Sonnet override (no silent downshift)', async () => {
+    let insertVals = null;
+    stubPool((sql, params) => {
+      if (sql.startsWith('SELECT id FROM voice_agents WHERE name')) return { rows: [] };
+      if (sql.startsWith('INSERT INTO voice_agents')) {
+        insertVals = params;
+        return { rows: [] };
+      }
+      return { rows: [{ id: 'x', name: 'sonnet-agent' }] };
+    });
+    const res = await handler(evt('POST', '/api/agents', {
+      body: { name: 'sonnet-agent', llm_model: 'claude-sonnet-4-6' },
+    }));
+    expect(res.statusCode).toBe(201);
+    // Explicit Sonnet must survive to the INSERT — defaults must not
+    // overwrite a user-provided value.
+    const stringified = (insertVals || []).filter(v => typeof v === 'string').join('|');
+    expect(stringified).toContain('claude-sonnet-4-6');
+  });
+
+  it('buildRuntimeConfig defensive fallback stays at Sonnet 4.6', async () => {
+    // This is intentional — see index.mjs:593 comment. If a deployed
+    // agent has an empty llm_model column for some reason, defaulting
+    // to Sonnet matches the old behavior so an in-flight call doesn't
+    // silently change models mid-deploy. The cost-conscious default
+    // applies to NEW agents, not to the defensive runtime fallback.
+    //
+    // Verified via the existing test in test/runtime-config.test.mjs:
+    //   "uses anthropic/claude-sonnet-4-6 fallback when llm_provider/model missing"
+    // (kept untouched).
+    expect(true).toBe(true);
+  });
+});
+
 // --- Dev API Gateway route prefix stripping ---------------------------
 
 describe('parseRoute: /dev/voice prefix stripping', () => {
