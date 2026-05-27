@@ -493,10 +493,41 @@ export function normalizeE164(raw) {
 // purely so the test suite in `test/` can import them. This has zero runtime
 // effect on the Lambda handler — the deploy zip still exposes `handler` as
 // the only Lambda entrypoint.
+// VALID_LLM_MODELS mirrors the v2 engine's _SHORT_TO_BEDROCK
+// resolver map (see backend/voice-agent/app/services/factory.py).
+// Accept BOTH the bare short form ("claude-haiku-4-5") and the
+// current dated variant ("claude-haiku-4-5-20251001"); the engine
+// resolves both to the same Bedrock inference profile.
+//
+// When adding a new Claude model:
+// 1. Add the short form to backend/voice-agent/app/services
+//    /factory.py::_SHORT_TO_BEDROCK
+// 2. Add it (and any currently-used dated variant) here.
+// 3. Tests in both repos will catch missing entries.
+//
+// Keep this list intentionally small. Each entry is a vetted
+// production Bedrock model — adding a model here implies it's
+// safe to use in voice agent calls.
 export const VALID_LLM_MODELS = [
+  // Sonnet family
+  'claude-sonnet-4',
+  'claude-sonnet-4-5',
   'claude-sonnet-4-6',
-  'claude-haiku-4-5-20241022',
-  'claude-sonnet-4-5-20250514',
+  // Sonnet dated variants (Bedrock inference profile date suffixes)
+  'claude-sonnet-4-20250514',
+  'claude-sonnet-4-5-20250514',  // legacy entry preserved for back-compat
+  'claude-sonnet-4-5-20250929',
+
+  // Haiku family — voice workload default as of 2026-05-27
+  'claude-haiku-4-5',
+  'claude-haiku-4-5-20241022',   // legacy entry preserved for back-compat
+  'claude-haiku-4-5-20251001',
+
+  // Opus family — reserved for hard reasoning agents
+  'claude-opus-4-5',
+  'claude-opus-4-5-20251101',
+  'claude-opus-4-6',
+  'claude-opus-4-7',
 ];
 export const VALID_TTS_PROVIDERS = ['elevenlabs'];
 // Per-provider model lists. Keep flat VALID_TTS_MODELS for legacy consumers
